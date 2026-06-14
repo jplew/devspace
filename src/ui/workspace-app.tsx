@@ -30,17 +30,16 @@ type ToolName =
   | "ls"
   | "bash";
 
-type LoadState = "idle" | "loading" | "loaded" | "error";
 type HostContext = NonNullable<ReturnType<App["getHostContext"]>>;
 
 interface ToolResultCard {
   tool: ToolName;
-  resultId?: string;
   workspaceId?: string;
   path?: string;
   root?: string;
   status?: string;
   summary?: Record<string, unknown>;
+  payload?: ToolPayload;
   agentsFiles?: Array<{
     path?: string;
     content?: string;
@@ -68,11 +67,6 @@ interface ToolPayload {
   content?: ToolContent[];
   diff?: string;
   patch?: string;
-}
-
-interface PayloadResult {
-  payload?: ToolPayload;
-  summary?: Record<string, unknown>;
 }
 
 function isToolName(value: unknown): value is ToolName {
@@ -120,11 +114,6 @@ function isShellTool(tool: ToolName): boolean {
   return tool === "run_shell" || tool === "bash";
 }
 
-function resultIdFromMeta(result: CallToolResult): string | undefined {
-  const meta = result._meta as Record<string, unknown> | undefined;
-  return typeof meta?.resultId === "string" ? meta.resultId : undefined;
-}
-
 function cardFromMeta(result: CallToolResult): Partial<ToolResultCard> | undefined {
   const meta = result._meta as Record<string, unknown> | undefined;
   const card = meta?.card;
@@ -141,14 +130,11 @@ function getStructuredContent<T>(result: CallToolResult): T | undefined {
 
 function AppRoot() {
   const appRef = useRef<App | null>(null);
-  const [app, setApp] = useState<App | null>(null);
   const [connected, setConnected] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [hostContext, setHostContext] = useState<HostContext | undefined>();
   const [card, setCard] = useState<ToolResultCard | null>(null);
-  const [payload, setPayload] = useState<ToolPayload | null>(null);
   const [expanded, setExpanded] = useState(false);
-  const [loadState, setLoadState] = useState<LoadState>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
@@ -167,20 +153,15 @@ function AppRoot() {
         ? { ...structuredContent, ...metaCard }
         : structuredContent;
       const tool = toolNameFromMeta(result);
-      const resultId = resultIdFromMeta(result);
       if (!tool || !isToolResultCard(structured)) {
         setCard(null);
-        setPayload(null);
         setExpanded(false);
-        setLoadState("idle");
         setErrorMessage("No result card is available for this tool result.");
         return;
       }
 
-      setCard({ ...structured, tool, resultId });
-      setPayload(null);
+      setCard({ ...structured, tool });
       setExpanded(false);
-      setLoadState("idle");
       setErrorMessage(null);
     };
 
@@ -198,7 +179,6 @@ function AppRoot() {
       .then(() => {
         const initialContext = createdApp.getHostContext();
         if (initialContext) setHostContext(initialContext);
-        setApp(createdApp);
         setConnected(true);
       })
       .catch((connectError: unknown) => {
@@ -260,53 +240,9 @@ function AppRoot() {
     [themeType],
   );
 
-  const loadPayload = useCallback(async () => {
-    if (!app || !card?.resultId || payload || loadState === "loading") return;
-
-    setLoadState("loading");
-    setErrorMessage(null);
-
-    try {
-      const result = await app.callServerTool({
-        name: "get_tool_result_payload",
-        arguments: {
-          workspaceId: card.workspaceId,
-          resultId: card.resultId,
-        },
-      });
-      const structured = getStructuredContent<PayloadResult>(result);
-      if (structured?.summary) {
-        setCard((current) => {
-          if (!current || current.resultId !== card.resultId) return current;
-
-          return {
-            ...current,
-            summary: {
-              ...current.summary,
-              ...structured.summary,
-            },
-          };
-        });
-      }
-      setPayload(structured?.payload ?? {});
-      setLoadState("loaded");
-    } catch (payloadError) {
-      setErrorMessage(
-        payloadError instanceof Error
-          ? payloadError.message
-          : String(payloadError),
-      );
-      setLoadState("error");
-    }
-  }, [app, card, loadState, payload]);
-
   const toggleExpanded = useCallback(() => {
-    setExpanded((nextExpanded) => {
-      const shouldExpand = !nextExpanded;
-      if (shouldExpand) void loadPayload();
-      return shouldExpand;
-    });
-  }, [loadPayload]);
+    setExpanded((nextExpanded) => !nextExpanded);
+  }, []);
 
   if (connectionError) return <EmptyState message={connectionError} tone="error" />;
   if (!connected) return <EmptyState message="Connecting to host..." />;
@@ -342,19 +278,13 @@ function AppRoot() {
             </span>
           </span>
           <SummaryBadges card={card} />
-          {loadState === "loading" ? (
-            <LoadingSpinner visible={expandable} />
-          ) : (
-            <ChevronIcon expanded={expanded} visible={expandable} />
-          )}
+          <ChevronIcon expanded={expanded} visible={expandable} />
         </button>
 
-        {expanded && loadState !== "loading" ? (
+        {expanded ? (
           <div className="tool-body">
             <ToolPayloadView
               card={card}
-              payload={payload}
-              loadState={loadState}
               errorMessage={errorMessage}
               fileOptions={fileOptions}
               diffOptions={diffOptions}
@@ -368,21 +298,16 @@ function AppRoot() {
 
 function ToolPayloadView({
   card,
-  payload,
-  loadState,
   errorMessage,
   fileOptions,
   diffOptions,
 }: {
   card: ToolResultCard;
-  payload: ToolPayload | null;
-  loadState: LoadState;
   errorMessage: string | null;
   fileOptions: FileStreamOptions;
   diffOptions: React.ComponentProps<typeof PatchDiff>["options"];
 }) {
-  if (loadState === "loading") return <StatusLine message="Loading details..." />;
-  if (loadState === "error") {
+  if (errorMessage) {
     return <StatusLine message={errorMessage ?? "Unable to load details."} tone="error" />;
   }
 
@@ -391,13 +316,13 @@ function ToolPayloadView({
   }
 
   if (isEditTool(card.tool) || isWriteTool(card.tool)) {
-    const patch = payload?.patch || payload?.diff;
+    const patch = card.payload?.patch || card.payload?.diff;
     if (!patch) return <StatusLine message="Diff payload is not available." />;
 
     return <DiffPayload patch={patch} diffOptions={diffOptions} />;
   }
 
-  const text = payloadText(payload);
+  const text = payloadText(card.payload);
   if (!text) return <StatusLine message="No details available." />;
 
   if (isReadTool(card.tool)) {
@@ -553,7 +478,7 @@ function isExpandableCard(card: ToolResultCard): boolean {
     );
   }
 
-  return Boolean(card.resultId);
+  return Boolean(card.payload);
 }
 
 function getToolDisplay(card: ToolResultCard): {
@@ -622,16 +547,6 @@ function IconSvg({
     >
       {children}
     </svg>
-  );
-}
-
-function LoadingSpinner({ visible }: { visible: boolean }) {
-  if (!visible) return <span className="chevron" aria-hidden="true" />;
-
-  return (
-    <span className="chevron spinner" aria-hidden="true">
-      <span className="spinner-ring" />
-    </span>
   );
 }
 
@@ -735,7 +650,7 @@ function TerminalIcon() {
   );
 }
 
-function payloadText(payload: ToolPayload | null): string {
+function payloadText(payload: ToolPayload | undefined): string {
   return (
     payload?.content
       ?.map((item) => {

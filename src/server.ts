@@ -25,11 +25,6 @@ import {
   runShellTool,
   writeFileTool,
 } from "./pi-tools.js";
-import {
-  countDiffStats,
-  createResultStore,
-  type ToolResultStore,
-} from "./result-store.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
@@ -73,24 +68,10 @@ interface WorkspaceAppManifestEntry {
 
 type WorkspaceAppManifest = Record<string, WorkspaceAppManifestEntry>;
 
-const storedToolNameSchema = z.enum([
-  "open_workspace",
-  "read_file",
-  "write_file",
-  "edit_file",
-  "grep_files",
-  "find_files",
-  "list_directory",
-  "run_shell",
-  "read",
-  "write",
-  "edit",
-  "grep",
-  "glob",
-  "ls",
-  "bash",
-]);
-const summarySchema = z.record(z.string(), z.unknown());
+interface DiffStats {
+  additions: number;
+  removals: number;
+}
 
 interface ToolNames {
   openWorkspace: "open_workspace";
@@ -140,23 +121,6 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
 
   return `Use DevSpace as a local coding workspace. First call ${toolNames.openWorkspace} with a project directory inside an allowed root. Then use the returned workspaceId for all file, search, edit, write, and shell tools. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.`;
 }
-const toolPayloadSchema = z.object({
-  content: z
-    .array(
-      z.union([
-        z.object({ type: z.literal("text"), text: z.string() }),
-        z.object({
-          type: z.literal("image"),
-          data: z.string(),
-          mimeType: z.string(),
-        }),
-      ]),
-    )
-    .optional(),
-  diff: z.string().optional(),
-  patch: z.string().optional(),
-});
-
 function cardOutputSchema(
   summary: z.ZodType,
   extra: z.ZodRawShape = {},
@@ -238,6 +202,20 @@ function contentLineCount(content: string): number {
   return content.endsWith("\n")
     ? content.slice(0, -1).split("\n").length
     : content.split("\n").length;
+}
+
+function countDiffStats(diff: string | undefined): DiffStats {
+  if (!diff) return { additions: 0, removals: 0 };
+
+  let additions = 0;
+  let removals = 0;
+
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+") && !line.startsWith("+++")) additions++;
+    if (line.startsWith("-") && !line.startsWith("---")) removals++;
+  }
+
+  return { additions, removals };
 }
 
 function newFilePatch(path: string, content: string): string {
@@ -354,7 +332,6 @@ async function assertWorkspaceAppAssets(): Promise<void> {
 function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
-  results: ToolResultStore,
   autoCommit: ReturnType<typeof createAutoCommitManager>,
 ): McpServer {
   const toolNames = toolNamesFor(config);
@@ -398,62 +375,6 @@ function createMcpServer(
             },
           },
         ],
-      };
-    },
-  );
-
-  registerAppTool(
-    server,
-    "get_tool_result_payload",
-    {
-      title: "Get tool result payload",
-      description:
-        "Fetch the full payload for a tool result. This is app-only and hidden from the model.",
-      inputSchema: {
-        workspaceId: z
-          .string()
-          .optional()
-          .describe("Workspace identifier returned by open_workspace."),
-        resultId: z.string().describe("Result identifier returned by a tool."),
-      },
-      outputSchema: {
-        tool: z.literal("get_tool_result_payload"),
-        resultId: z.string(),
-        workspaceId: z.string().optional(),
-        sourceTool: storedToolNameSchema,
-        label: z.string().optional(),
-        path: z.string().optional(),
-        summary: summarySchema,
-        payload: toolPayloadSchema,
-      },
-      _meta: {
-        ui: {
-          resourceUri: WORKSPACE_APP_URI,
-          visibility: ["app"],
-        },
-      },
-      annotations: { readOnlyHint: true },
-    },
-    async ({ workspaceId, resultId }) => {
-      const result = results.get(resultId, workspaceId);
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Loaded payload for ${result.label ?? result.path ?? result.tool}.`,
-          },
-        ],
-        structuredContent: {
-          tool: "get_tool_result_payload",
-          resultId,
-          workspaceId,
-          sourceTool: result.tool,
-          label: result.label,
-          path: result.path,
-          summary: result.summary,
-          payload: result.payload,
-        },
       };
     },
   );
@@ -662,19 +583,18 @@ function createMcpServer(
         offset: input.offset ?? 1,
         limited: input.limit !== undefined,
       };
-      const storedResult = results.put({
-        workspaceId,
-        workspaceRoot: workspace.root,
-        tool: toolNames.read,
-        path: input.path,
-        label: input.path,
-        summary,
-        payload: { content: response.content },
-      });
 
       return {
         ...response,
-        _meta: { tool: toolNames.read, resultId: storedResult.id },
+        _meta: {
+          tool: toolNames.read,
+          card: {
+            workspaceId,
+            path: input.path,
+            summary,
+            payload: { content: response.content },
+          },
+        },
         structuredContent: {
           workspaceId,
           path: input.path,
@@ -734,18 +654,6 @@ function createMcpServer(
         lines: contentLineCount(input.content),
         characters: input.content.length,
       };
-      const storedResult = results.put({
-        workspaceId,
-        workspaceRoot: workspace.root,
-        tool: toolNames.write,
-        path: input.path,
-        label: input.path,
-        summary,
-        payload: {
-          content: response.content,
-          patch,
-        },
-      });
       autoCommit.recordToolCall({
         workspaceId,
         workspaceRoot: workspace.root,
@@ -758,7 +666,18 @@ function createMcpServer(
 
       return {
         ...response,
-        _meta: { tool: toolNames.write, resultId: storedResult.id },
+        _meta: {
+          tool: toolNames.write,
+          card: {
+            workspaceId,
+            path: input.path,
+            summary,
+            payload: {
+              content: response.content,
+              patch,
+            },
+          },
+        },
         structuredContent: {
           workspaceId,
           path: input.path,
@@ -827,21 +746,10 @@ function createMcpServer(
       const stats = countDiffStats(
         response.details?.patch ?? response.details?.diff,
       );
-      const storedResult = results.put({
-        workspaceId,
-        workspaceRoot: workspace.root,
-        tool: toolNames.edit,
-        path: input.path,
-        label: input.path,
-        summary: {
-          ...stats,
-          editCount: input.edits.length,
-        },
-        payload: {
-          diff: response.details?.diff,
-          patch: response.details?.patch,
-        },
-      });
+      const summary = {
+        ...stats,
+        editCount: input.edits.length,
+      };
       const editResultText = `Edited ${input.path} (+${stats.additions} -${stats.removals}).`;
       const editContent = [textBlock(editResultText)];
       autoCommit.recordToolCall({
@@ -857,12 +765,23 @@ function createMcpServer(
 
       return {
         content: editContent,
-        _meta: { tool: toolNames.edit, resultId: storedResult.id },
+        _meta: {
+          tool: toolNames.edit,
+          card: {
+            workspaceId,
+            path: input.path,
+            summary,
+            payload: {
+              diff: response.details?.diff,
+              patch: response.details?.patch,
+            },
+          },
+        },
         structuredContent: {
           workspaceId,
           status: "applied",
           path: input.path,
-          summary: storedResult.summary,
+          summary,
           result: contentText(editContent),
         },
       };
@@ -921,19 +840,18 @@ function createMcpServer(
           scope: input.path ?? ".",
           ...textSummary(response.content),
         };
-        const storedResult = results.put({
-          workspaceId,
-          workspaceRoot: workspace.root,
-          tool: toolNames.grep,
-          path: input.path,
-          label: input.pattern,
-          summary,
-          payload: { content: response.content },
-        });
 
         return {
           ...response,
-          _meta: { tool: toolNames.grep, resultId: storedResult.id },
+          _meta: {
+            tool: toolNames.grep,
+            card: {
+              workspaceId,
+              path: input.path,
+              summary,
+              payload: { content: response.content },
+            },
+          },
           structuredContent: {
             workspaceId,
             path: input.path,
@@ -992,19 +910,18 @@ function createMcpServer(
           scope: input.path ?? ".",
           ...textSummary(response.content),
         };
-        const storedResult = results.put({
-          workspaceId,
-          workspaceRoot: workspace.root,
-          tool: toolNames.glob,
-          path: input.path,
-          label: input.pattern,
-          summary,
-          payload: { content: response.content },
-        });
 
         return {
           ...response,
-          _meta: { tool: toolNames.glob, resultId: storedResult.id },
+          _meta: {
+            tool: toolNames.glob,
+            card: {
+              workspaceId,
+              path: input.path,
+              summary,
+              payload: { content: response.content },
+            },
+          },
           structuredContent: {
             workspaceId,
             path: input.path,
@@ -1057,19 +974,18 @@ function createMcpServer(
         if (response.isError) return response;
 
         const summary = textSummary(response.content);
-        const storedResult = results.put({
-          workspaceId,
-          workspaceRoot: workspace.root,
-          tool: toolNames.ls,
-          path: input.path,
-          label: input.path,
-          summary,
-          payload: { content: response.content },
-        });
 
         return {
           ...response,
-          _meta: { tool: toolNames.ls, resultId: storedResult.id },
+          _meta: {
+            tool: toolNames.ls,
+            card: {
+              workspaceId,
+              path: input.path,
+              summary,
+              payload: { content: response.content },
+            },
+          },
           structuredContent: {
             workspaceId,
             path: input.path,
@@ -1145,15 +1061,6 @@ function createMcpServer(
         workingDirectory: workingDirectory ?? ".",
         ...textSummary(response.content),
       };
-      const storedResult = results.put({
-        workspaceId,
-        workspaceRoot: workspace.root,
-        tool: toolNames.shell,
-        path: workingDirectory,
-        label: input.command,
-        summary,
-        payload: { content: response.content },
-      });
       autoCommit.recordToolCall({
         workspaceId,
         workspaceRoot: workspace.root,
@@ -1165,7 +1072,15 @@ function createMcpServer(
 
       return {
         ...response,
-        _meta: { tool: toolNames.shell, resultId: storedResult.id },
+        _meta: {
+          tool: toolNames.shell,
+          card: {
+            workspaceId,
+            path: workingDirectory,
+            summary,
+            payload: { content: response.content },
+          },
+        },
         structuredContent: {
           workspaceId,
           path: workingDirectory,
@@ -1187,7 +1102,6 @@ export function createServer(config = loadConfig()): RunningServer {
   const transports = new Map<string, Transport>();
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
-  const results = createResultStore(config.stateDir);
   const autoCommit = createAutoCommitManager({ config: config.autocommit });
 
   app.options("/mcp-app-assets/{*asset}", (_req, res) => {
@@ -1238,7 +1152,7 @@ export function createServer(config = loadConfig()): RunningServer {
           if (closedSessionId) transports.delete(closedSessionId);
         };
 
-        const server = createMcpServer(config, workspaces, results, autoCommit);
+        const server = createMcpServer(config, workspaces, autoCommit);
         await server.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
