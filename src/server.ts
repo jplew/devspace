@@ -44,8 +44,7 @@ function sendJsonRpcError(
   });
 }
 
-function createMcpServer(config: ServerConfig): McpServer {
-  const workspaces = new WorkspaceRegistry(config);
+function createMcpServer(config: ServerConfig, workspaces: WorkspaceRegistry): McpServer {
   const server = new McpServer(
     {
       name: "local-coding-workspace",
@@ -370,9 +369,10 @@ function createMcpServer(config: ServerConfig): McpServer {
 export function createServer(config = loadConfig()): RunningServer {
   const app = createMcpExpressApp({
     host: config.host,
-    allowedHosts: [config.host, "localhost", "127.0.0.1"],
+    allowedHosts: Array.from(new Set([config.host, ...config.allowedHosts])),
   });
   const transports = new Map<string, Transport>();
+  const workspaces = new WorkspaceRegistry(config);
 
   app.get("/healthz", (_req, res) => {
     res.json({ ok: true, name: "pi-on-mcp" });
@@ -407,7 +407,7 @@ export function createServer(config = loadConfig()): RunningServer {
           if (closedSessionId) transports.delete(closedSessionId);
         };
 
-        const server = createMcpServer(config);
+        const server = createMcpServer(config, workspaces);
         await server.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");

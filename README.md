@@ -54,13 +54,14 @@ npm run build
 
 PI_ON_MCP_TOKEN="change-me" \
 PI_ON_MCP_ALLOWED_ROOTS="/home/waishnav/personal,/home/waishnav/work" \
+PI_ON_MCP_ALLOWED_HOSTS="localhost,127.0.0.1,agent.gitcms.blog" \
 npm run dev
 ```
 
 The MCP endpoint is:
 
 ```text
-http://127.0.0.1:8080/mcp
+http://127.0.0.1:7676/mcp
 ```
 
 Send `Authorization: Bearer <PI_ON_MCP_TOKEN>` when `PI_ON_MCP_TOKEN` is set.
@@ -70,7 +71,7 @@ Send `Authorization: Bearer <PI_ON_MCP_TOKEN>` when `PI_ON_MCP_TOKEN` is set.
 Point a Cloudflare Tunnel hostname at the local server:
 
 ```text
-http://127.0.0.1:8080
+http://127.0.0.1:7676
 ```
 
 Then configure the remote MCP client with:
@@ -86,6 +87,7 @@ remote code execution on this machine.
 
 - Always use `PI_ON_MCP_TOKEN` outside purely local smoke tests.
 - Keep `PI_ON_MCP_ALLOWED_ROOTS` narrow.
+- If you expose the server through a tunnel, add the tunnel hostname to `PI_ON_MCP_ALLOWED_HOSTS`.
 - Put Cloudflare Access or equivalent in front of the tunnel before exposing it.
 - `run_shell` can escape filesystem allowlists by design; shell access relies on
   authentication and client trust, not path containment.
