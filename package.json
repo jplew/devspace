@@ -1,9 +1,20 @@
 {
-  "name": "devspace",
+  "name": "@waishnav/devspace",
   "version": "1.0.0",
   "description": "Expose a secure local coding workspace through an MCP server.",
   "type": "module",
   "main": "dist/server.js",
+  "bin": {
+    "devspace": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "npm run build:app && tsc -p tsconfig.build.json",
     "build:app": "vite build",

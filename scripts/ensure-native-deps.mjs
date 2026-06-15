@@ -4,7 +4,9 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 
 try {
-  require("better-sqlite3");
+  const Database = require("better-sqlite3");
+  const db = new Database(":memory:");
+  db.close();
 } catch (error) {
   if (!isNativeModuleMismatch(error)) {
     throw error;

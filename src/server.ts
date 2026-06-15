@@ -1265,9 +1265,12 @@ function createMcpServer(
 }
 
 export function createServer(config = loadConfig()): RunningServer {
+  const allowedHosts = config.allowedHosts.includes("*")
+    ? undefined
+    : Array.from(new Set([config.host, ...config.allowedHosts]));
   const app = createMcpExpressApp({
     host: config.host,
-    allowedHosts: Array.from(new Set([config.host, ...config.allowedHosts])),
+    ...(allowedHosts ? { allowedHosts } : {}),
   });
   const transports = new Map<string, Transport>();
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
