@@ -1,15 +1,20 @@
 import { randomUUID } from "node:crypto";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 
 const DEFAULT_YIELD_MS = 10_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
 const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
+const DEFAULT_COLUMNS = 80;
+const DEFAULT_ROWS = 24;
 
 export interface StartCommandInput {
   workspaceId: string;
   command: string;
   cwd: string;
+  tty?: boolean;
+  columns?: number;
+  rows?: number;
   yieldTimeMs?: number;
   maxOutputTokens?: number;
 }
@@ -18,6 +23,8 @@ export interface WriteStdinInput {
   workspaceId: string;
   sessionId: string;
   chars?: string;
+  columns?: number;
+  rows?: number;
   yieldTimeMs?: number;
   maxOutputTokens?: number;
 }
@@ -28,21 +35,29 @@ export interface ProcessSnapshot {
   outputTruncated: boolean;
   running: boolean;
   exitCode?: number;
-  signal?: NodeJS.Signals;
+  signal?: string;
   wallTimeMs: number;
+}
+
+interface ManagedProcess {
+  write(data: string): void;
+  kill(signal?: NodeJS.Signals): void;
+  resize?(columns: number, rows: number): void;
 }
 
 interface ProcessSession {
   id: string;
   workspaceId: string;
-  child: ChildProcessWithoutNullStreams;
+  process?: ManagedProcess;
   startedAt: number;
+  columns: number;
+  rows: number;
   buffer: string;
   bufferStart: number;
   consumedThrough: number;
   running: boolean;
   exitCode?: number;
-  signal?: NodeJS.Signals;
+  signal?: string;
   exitPromise: Promise<void>;
   resolveExit: () => void;
   cleanupTimer?: NodeJS.Timeout;
@@ -55,8 +70,18 @@ interface ProcessSessionManagerOptions {
 
 function boundedInteger(value: number | undefined, fallback: number, maximum: number): number {
   if (value === undefined) return fallback;
-  if (!Number.isFinite(value) || value < 0) throw new Error("Duration and output limits must be non-negative.");
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error("Duration and output limits must be non-negative.");
+  }
   return Math.min(Math.floor(value), maximum);
+}
+
+function terminalSize(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || value < 1 || value > 1_000) {
+    throw new Error("Terminal dimensions must be integers between 1 and 1000.");
+  }
+  return value;
 }
 
 function shellCommand(command: string): { executable: string; args: string[] } {
@@ -71,6 +96,12 @@ function shellCommand(command: string): { executable: string; args: string[] } {
     executable: process.env.SHELL ?? "/bin/bash",
     args: ["-lc", command],
   };
+}
+
+function processEnvironment(): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  );
 }
 
 function truncateOutput(output: string, maxOutputTokens: number): { output: string; truncated: boolean } {
@@ -98,44 +129,16 @@ export class ProcessSessionManager {
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
-    const id = randomUUID();
-    const shell = shellCommand(input.command);
-    const child = spawn(shell.executable, shell.args, {
-      cwd: input.cwd,
-      env: process.env,
-      stdio: "pipe",
-      windowsHide: true,
-    });
+    const session = this.createSession(input);
+    this.sessions.set(session.id, session);
 
-    let resolveExit = (): void => undefined;
-    const exitPromise = new Promise<void>((resolve) => {
-      resolveExit = resolve;
-    });
-    const session: ProcessSession = {
-      id,
-      workspaceId: input.workspaceId,
-      child,
-      startedAt: Date.now(),
-      buffer: "",
-      bufferStart: 0,
-      consumedThrough: 0,
-      running: true,
-      exitPromise,
-      resolveExit,
-    };
-    this.sessions.set(id, session);
-
-    child.stdout.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
-    child.stderr.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
-    child.on("error", (error) => this.append(session, `${error.message}\n`));
-    child.on("close", (code, signal) => {
-      session.running = false;
-      session.exitCode = code ?? undefined;
-      session.signal = signal ?? undefined;
-      session.resolveExit();
-      session.cleanupTimer = setTimeout(() => this.sessions.delete(id), this.completedSessionTtlMs);
-      session.cleanupTimer.unref();
-    });
+    try {
+      if (input.tty) await this.startPty(session, input);
+      else this.startPipe(session, input);
+    } catch (error) {
+      this.sessions.delete(session.id);
+      throw error;
+    }
 
     const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_YIELD_MS, 30_000);
     await Promise.race([
@@ -152,11 +155,20 @@ export class ProcessSessionManager {
     const session = this.getOwnedSession(input.workspaceId, input.sessionId);
     const chars = input.chars ?? "";
 
+    if (input.columns !== undefined || input.rows !== undefined) {
+      session.columns = terminalSize(input.columns, session.columns);
+      session.rows = terminalSize(input.rows, session.rows);
+      if (!session.process?.resize) {
+        throw new Error(`Process session ${session.id} is not a PTY and cannot be resized.`);
+      }
+      session.process.resize(session.columns, session.rows);
+    }
+
     if (chars.includes("\u0003") && session.running) {
-      session.child.kill("SIGINT");
+      session.process?.kill("SIGINT");
     }
     const writableChars = chars.replaceAll("\u0003", "");
-    if (writableChars && session.running) session.child.stdin.write(writableChars);
+    if (writableChars && session.running) session.process?.write(writableChars);
 
     const hasUnreadOutput = session.consumedThrough < session.bufferStart + session.buffer.length;
     if (!hasUnreadOutput && session.running) {
@@ -174,15 +186,98 @@ export class ProcessSessionManager {
 
   terminate(workspaceId: string, sessionId: string): void {
     const session = this.getOwnedSession(workspaceId, sessionId);
-    if (session.running) session.child.kill("SIGTERM");
+    if (session.running) session.process?.kill("SIGTERM");
   }
 
   shutdown(): void {
     for (const session of this.sessions.values()) {
       if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
-      if (session.running) session.child.kill("SIGTERM");
+      if (session.running) session.process?.kill("SIGTERM");
     }
     this.sessions.clear();
+  }
+
+  private createSession(input: StartCommandInput): ProcessSession {
+    let resolveExit = (): void => undefined;
+    const exitPromise = new Promise<void>((resolve) => {
+      resolveExit = resolve;
+    });
+
+    return {
+      id: randomUUID(),
+      workspaceId: input.workspaceId,
+      startedAt: Date.now(),
+      columns: terminalSize(input.columns, DEFAULT_COLUMNS),
+      rows: terminalSize(input.rows, DEFAULT_ROWS),
+      buffer: "",
+      bufferStart: 0,
+      consumedThrough: 0,
+      running: true,
+      exitPromise,
+      resolveExit,
+    };
+  }
+
+  private startPipe(session: ProcessSession, input: StartCommandInput): void {
+    const shell = shellCommand(input.command);
+    const child = spawn(shell.executable, shell.args, {
+      cwd: input.cwd,
+      env: process.env,
+      stdio: "pipe",
+      windowsHide: true,
+    });
+
+    session.process = {
+      write: (data) => child.stdin.write(data),
+      kill: (signal) => {
+        child.kill(signal);
+      },
+    };
+    child.stdout.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
+    child.stderr.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
+    child.on("error", (error) => this.append(session, `${error.message}\n`));
+    child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
+  }
+
+  private async startPty(session: ProcessSession, input: StartCommandInput): Promise<void> {
+    let nodePty: typeof import("node-pty");
+    try {
+      nodePty = await import("node-pty");
+    } catch {
+      throw new Error("PTY support requires the optional node-pty dependency.");
+    }
+
+    const shell = shellCommand(input.command);
+    const pty = nodePty.spawn(shell.executable, shell.args, {
+      cwd: input.cwd,
+      env: processEnvironment(),
+      name: "xterm-256color",
+      cols: session.columns,
+      rows: session.rows,
+    });
+
+    session.process = {
+      write: (data) => pty.write(data),
+      kill: (signal) => pty.kill(signal),
+      resize: (columns, rows) => pty.resize(columns, rows),
+    };
+    pty.onData((data) => this.append(session, data));
+    pty.onExit(({ exitCode, signal }) => {
+      this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
+    });
+  }
+
+  private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
+    if (!session.running) return;
+    session.running = false;
+    session.exitCode = exitCode;
+    session.signal = signal;
+    session.resolveExit();
+    session.cleanupTimer = setTimeout(
+      () => this.sessions.delete(session.id),
+      this.completedSessionTtlMs,
+    );
+    session.cleanupTimer.unref();
   }
 
   private append(session: ProcessSession, output: string): void {
@@ -200,11 +295,7 @@ export class ProcessSessionManager {
     const unread = session.buffer.slice(start);
     session.consumedThrough = session.bufferStart + session.buffer.length;
 
-    const limit = boundedInteger(
-      maxOutputTokens,
-      DEFAULT_MAX_OUTPUT_TOKENS,
-      100_000,
-    );
+    const limit = boundedInteger(maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 100_000);
     const truncated = truncateOutput(unread, limit);
 
     return {

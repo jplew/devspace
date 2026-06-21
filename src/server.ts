@@ -524,6 +524,12 @@ function registerCodexProcessTools(
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
         cmd: z.string().min(1).describe("Shell command to execute."),
+        tty: z
+          .boolean()
+          .optional()
+          .describe("Allocate a pseudo-terminal for interactive commands. Defaults to false."),
+        columns: z.number().int().min(1).max(1_000).optional().describe("Initial PTY width. Defaults to 80."),
+        rows: z.number().int().min(1).max(1_000).optional().describe("Initial PTY height. Defaults to 24."),
         workingDirectory: z
           .string()
           .optional()
@@ -547,7 +553,7 @@ function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
@@ -555,6 +561,9 @@ function registerCodexProcessTools(
         workspaceId,
         command: cmd,
         cwd,
+        tty,
+        columns,
+        rows,
         yieldTimeMs,
         maxOutputTokens,
       });
@@ -590,6 +599,8 @@ function registerCodexProcessTools(
         workspaceId: z.string().describe("Workspace identifier used to start the process."),
         sessionId: z.string().describe("Process session identifier returned by exec_command."),
         chars: z.string().optional().describe("Characters to write. Omit or pass an empty string to poll."),
+        columns: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this width."),
+        rows: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this height."),
         yieldTimeMs: z
           .number()
           .int()
@@ -609,13 +620,15 @@ function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, sessionId, chars, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       workspaces.getWorkspace(workspaceId);
       const snapshot = await processSessions.write({
         workspaceId,
         sessionId,
         chars,
+        columns,
+        rows,
         yieldTimeMs,
         maxOutputTokens,
       });

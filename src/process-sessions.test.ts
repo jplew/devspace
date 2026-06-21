@@ -74,4 +74,27 @@ const buffered = await manager.start({
 assert.equal(buffered.outputTruncated, true);
 if (buffered.sessionId) manager.terminate("workspace-a", buffered.sessionId);
 
+const pty = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "process.stdin.once('data', () => { console.log('columns:' + process.stdout.columns); process.exit(0); })"`,
+  tty: true,
+  columns: 80,
+  rows: 24,
+  yieldTimeMs: 10,
+});
+assert.equal(pty.running, true);
+assert.ok(pty.sessionId);
+
+const resizedPty = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: pty.sessionId,
+  chars: "continue\r",
+  columns: 120,
+  rows: 30,
+  yieldTimeMs: 2_000,
+});
+assert.equal(resizedPty.running, false);
+assert.match(resizedPty.output, /columns:120/);
+
 manager.shutdown();
