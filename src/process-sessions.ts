@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
 const DEFAULT_YIELD_MS = 10_000;
@@ -246,14 +249,31 @@ export class ProcessSessionManager {
       throw new Error("PTY support requires the optional node-pty dependency.");
     }
 
-    const shell = resolveShellCommand(input.command);
-    const pty = nodePty.spawn(shell.executable, shell.args, {
-      cwd: input.cwd,
-      env: processEnvironment(),
-      name: "xterm-256color",
-      cols: session.columns,
-      rows: session.rows,
-    });
+    let scriptDirectory: string | undefined;
+    let command = input.command;
+    if (process.platform === "win32") {
+      scriptDirectory = await mkdtemp(join(tmpdir(), "devspace-pty-"));
+      command = join(scriptDirectory, "command.cmd");
+      await writeFile(command, `@echo off\r\n${input.command}\r\n`, "utf8");
+    }
+
+    const cleanupScript = (): void => {
+      if (scriptDirectory) void rm(scriptDirectory, { recursive: true, force: true });
+    };
+    const shell = resolveShellCommand(command);
+    let pty: import("node-pty").IPty;
+    try {
+      pty = nodePty.spawn(shell.executable, shell.args, {
+        cwd: input.cwd,
+        env: processEnvironment(),
+        name: "xterm-256color",
+        cols: session.columns,
+        rows: session.rows,
+      });
+    } catch (error) {
+      cleanupScript();
+      throw error;
+    }
 
     session.process = {
       write: (data) => pty.write(data),
@@ -262,6 +282,7 @@ export class ProcessSessionManager {
     };
     pty.onData((data) => this.append(session, data));
     pty.onExit(({ exitCode, signal }) => {
+      cleanupScript();
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
     });
   }

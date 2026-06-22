@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 
 export interface ShellCommand {
   executable: string;
-  args: string[] | string;
+  args: string[];
 }
 
 export interface KillableProcess {
@@ -40,7 +40,7 @@ export function resolveShellCommand(
   if (platform === "win32") {
     return {
       executable: environment.ComSpec ?? environment.COMSPEC ?? "cmd.exe",
-      args: `/d /s /c ${command}`,
+      args: ["/d", "/s", "/c", command],
     };
   }
 
