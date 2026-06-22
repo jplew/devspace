@@ -256,7 +256,7 @@ export class ProcessSessionManager {
       command = join(scriptDirectory, "command.cmd");
       await writeFile(
         command,
-        `@ping 127.0.0.1 -n 2 > nul\r\n@echo off\r\n${input.command}\r\n@exit /b %errorlevel%\r\n`,
+        `@echo off\r\n${input.command}\r\n@exit %errorlevel%\r\n`,
         "utf8",
       );
     }
@@ -265,7 +265,7 @@ export class ProcessSessionManager {
       if (scriptDirectory) void rm(scriptDirectory, { recursive: true, force: true });
     };
     const shell = resolveShellCommand(command);
-    const shellArgs = process.platform === "win32" ? `/d /c "${command}"` : shell.args;
+    const shellArgs = process.platform === "win32" ? [] : shell.args;
     let pty: import("node-pty").IPty;
     try {
       pty = nodePty.spawn(shell.executable, shellArgs, {
@@ -290,6 +290,7 @@ export class ProcessSessionManager {
       cleanupScript();
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
     });
+    if (process.platform === "win32") pty.write(`"${command}"\r\n`);
   }
 
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
