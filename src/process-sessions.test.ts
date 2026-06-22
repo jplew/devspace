@@ -6,7 +6,9 @@ const manager = new ProcessSessionManager({
   completedSessionTtlMs: 1_000,
 });
 
-const node = JSON.stringify(process.execPath);
+const node = process.platform === "win32"
+  ? `"${process.execPath}"`
+  : JSON.stringify(process.execPath);
 
 const foreground = await manager.start({
   workspaceId: "workspace-a",
