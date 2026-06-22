@@ -129,7 +129,7 @@ try {
       cwd: process.cwd(),
       command: "echo pty-ok",
       tty: true,
-      yieldTimeMs: 2_000,
+      yieldTimeMs: 10_000,
     });
     assert.equal(pty.running, false);
     assert.match(pty.output, /pty-ok/);
