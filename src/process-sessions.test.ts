@@ -64,6 +64,26 @@ const inputResult = await manager.write({
 assert.equal(inputResult.running, false);
 assert.match(inputResult.output, /input:hello/);
 
+const noisyInteractive = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "setInterval(() => console.log('tick'), 10); process.stdin.once('data', data => { console.log('input:' + data.toString().trim()); process.exit(0); })"`,
+  yieldTimeMs: 100,
+});
+assert.equal(noisyInteractive.running, true);
+assert.ok(noisyInteractive.sessionId);
+
+await new Promise((resolve) => setTimeout(resolve, 50));
+const noisyInputResult = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: noisyInteractive.sessionId,
+  chars: "hello\n",
+  yieldTimeMs: 2_000,
+});
+assert.equal(noisyInputResult.running, false);
+assert.match(noisyInputResult.output, /tick/);
+assert.match(noisyInputResult.output, /input:hello/);
+
 const interruptible = await manager.start({
   workspaceId: "workspace-a",
   cwd: process.cwd(),

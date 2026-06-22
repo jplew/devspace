@@ -141,10 +141,7 @@ export class ProcessSessionManager {
     }
 
     const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_YIELD_MS, 30_000);
-    await Promise.race([
-      session.exitPromise,
-      new Promise<void>((resolve) => setTimeout(resolve, yieldTimeMs)),
-    ]);
+    await this.waitForExit(session, yieldTimeMs);
 
     const snapshot = this.consume(session, input.maxOutputTokens);
     if (!session.running) this.removeSession(session.id);
@@ -154,6 +151,8 @@ export class ProcessSessionManager {
   async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
     const session = this.getOwnedSession(input.workspaceId, input.sessionId);
     const chars = input.chars ?? "";
+    const interactionRequested =
+      chars.length > 0 || input.columns !== undefined || input.rows !== undefined;
 
     if (input.columns !== undefined || input.rows !== undefined) {
       session.columns = terminalSize(input.columns, session.columns);
@@ -172,12 +171,9 @@ export class ProcessSessionManager {
     if (writableChars && session.running) session.process?.write(writableChars);
 
     const hasUnreadOutput = session.consumedThrough < session.bufferStart + session.buffer.length;
-    if ((interruptRequested || !hasUnreadOutput) && session.running) {
+    if ((interactionRequested || !hasUnreadOutput) && session.running) {
       const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_YIELD_MS, 30_000);
-      await Promise.race([
-        session.exitPromise,
-        new Promise<void>((resolve) => setTimeout(resolve, yieldTimeMs)),
-      ]);
+      await this.waitForExit(session, yieldTimeMs);
     }
 
     const snapshot = this.consume(session, input.maxOutputTokens);
@@ -196,6 +192,20 @@ export class ProcessSessionManager {
       if (session.running) session.process?.kill("SIGTERM");
     }
     this.sessions.clear();
+  }
+
+  private async waitForExit(session: ProcessSession, yieldTimeMs: number): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        session.exitPromise,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, yieldTimeMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private createSession(input: StartCommandInput): ProcessSession {
