@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/server.js",
   "engines": {
-    "node": ">=20.12 <27"
+    "node": ">=22.19 <27"
   },
   "bin": {
     "devspace": "dist/cli.js"
@@ -33,7 +33,7 @@
   "license": "MIT",
   "dependencies": {
     "@clack/prompts": "^1.5.1",
-    "@earendil-works/pi-coding-agent": "^0.79.4",
+    "@earendil-works/pi-coding-agent": "^0.80.1",
     "@modelcontextprotocol/ext-apps": "^1.7.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@pierre/diffs": "^1.2.5",
