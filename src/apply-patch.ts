@@ -431,16 +431,22 @@ function unifiedFilePatch(
     "",
     "",
     { context: 3, headerOptions: FILE_HEADERS_ONLY },
-  ).trimEnd();
+  );
 
   return [
     `diff --git a/${oldPath} b/${newPath}`,
     oldContent === null ? "new file mode 100644" : undefined,
     newContent === null ? "deleted file mode 100644" : undefined,
-    body,
+    stripFinalNewline(body),
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n");
+}
+
+function stripFinalNewline(value: string): string {
+  if (value.endsWith("\r\n")) return value.slice(0, -2);
+  if (value.endsWith("\n")) return value.slice(0, -1);
+  return value;
 }
 
 function countPatchStats(patch: string): { additions: number; removals: number } {

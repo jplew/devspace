@@ -149,6 +149,27 @@ const splitHunkResult = await applyPatch(
 *** End Patch`,
 );
 assert.equal(splitHunkResult.patch.match(/^@@ /gm)?.length, 2);
+assert.equal(
+  await readFile(join(splitHunkRoot, "long.txt"), "utf8"),
+  [
+    "1", "two", "3", "4", "5", "6", "7", "8", "9", "10",
+    "11", "12", "13", "14", "15", "16", "17", "eighteen", "19", "20",
+  ].join("\n") + "\n",
+);
+
+const trailingSpaceRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-trailing-space-"));
+await writeFile(join(trailingSpaceRoot, "spaces.txt"), "old\n");
+const trailingSpaceResult = await applyPatch(
+  trailingSpaceRoot,
+  `*** Begin Patch
+*** Update File: spaces.txt
+@@
+-old
++new${"   "}
+*** End Patch`,
+);
+assert.equal(trailingSpaceResult.patch.endsWith("+new   "), true);
+assert.equal(await readFile(join(trailingSpaceRoot, "spaces.txt"), "utf8"), "new   \n");
 
 assert.throws(() => parsePatch("*** Begin Patch\n*** End Patch"), /contains no file actions/);
 assert.throws(() => parsePatch("*** Add File: bad.txt\n+x"), /missing .* marker/);
