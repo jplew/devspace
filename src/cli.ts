@@ -352,7 +352,7 @@ async function runAgentsRun(args: string[]): Promise<void> {
   const promptFile = writeAgentPromptFile(prompt);
 
   if (existing) {
-    store.update(existing.id, { status: "starting", error: undefined });
+    store.update(existing.id, { status: "starting", latestResponse: undefined, error: undefined });
     spawnAgentWorker(existing.id, promptFile);
     console.log(formatAgentLine({ ...existing, status: "running" }));
     return;
