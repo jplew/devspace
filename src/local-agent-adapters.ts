@@ -15,7 +15,7 @@ export interface LocalAgentAdapter {
 }
 
 const ACP_COMMANDS: Record<"cursor" | "copilot", [string, ...string[]]> = {
-  cursor: ["cursor-agent", "--acp"],
+  cursor: ["cursor-agent", "acp"],
   copilot: ["copilot", "--acp"],
 };
 const PI_AGENT_TIMEOUT_MS = 120_000;
@@ -124,6 +124,7 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
     const { client } = await import("@agentclientprotocol/sdk");
+    const { methods } = await import("@agentclientprotocol/sdk");
     const { ndJsonStream } = await import("@agentclientprotocol/sdk");
     const [command, ...args] = this.command;
     const child = spawn(command, args, {
@@ -144,16 +145,35 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
     );
     try {
       let providerSessionId = input.providerSessionId ?? null;
-      const finalResponse = await client({ name: "DevSpace" }).connectWith(stream, async (context) => {
-        const session = await context.buildSession(input.workspace).start();
-        providerSessionId = session.sessionId;
-        try {
-          await session.prompt(input.prompt);
-          return await session.readText();
-        } finally {
-          session.dispose();
-        }
-      });
+      const finalResponse = await client({ name: "DevSpace" })
+        .onRequest(methods.client.session.requestPermission, (context) => {
+          const selected = selectAcpAllowPermissionOption(context.params.options);
+          return selected
+            ? { outcome: { outcome: "selected", optionId: selected.optionId } }
+            : { outcome: { outcome: "cancelled" } };
+        })
+        .connectWith(stream, async (context) => {
+          const session = await context.buildSession(input.workspace).start();
+          providerSessionId = session.sessionId;
+          try {
+            const prompt = session.prompt(input.prompt);
+            const textParts: string[] = [];
+            for (;;) {
+              const message = await session.nextUpdate();
+              if (message.kind === "stop") {
+                await prompt;
+                return textParts.join("").trim();
+              }
+
+              const update = message.update;
+              if (update.sessionUpdate !== "agent_message_chunk") continue;
+              const content = update.content;
+              if (content.type === "text") textParts.push(content.text);
+            }
+          } finally {
+            session.dispose();
+          }
+        });
       return {
         provider: this.provider,
         providerSessionId,
@@ -166,6 +186,13 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
       child.kill();
     }
   }
+}
+
+function selectAcpAllowPermissionOption(options: Array<{ optionId: string; kind: string }>): { optionId: string } | undefined {
+  return (
+    options.find((option) => option.kind === "allow_once") ??
+    options.find((option) => option.kind === "allow_always")
+  );
 }
 
 class PiRpcLocalAgentAdapter implements LocalAgentAdapter {
