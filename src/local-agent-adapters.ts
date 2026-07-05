@@ -310,6 +310,7 @@ class JsonLineRpc {
   private buffer = "";
   private nextId = 1;
   private stderr = "";
+  private fatalError: Error | undefined;
 
   constructor(private readonly child: ChildProcessWithoutNullStreams) {
     child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk.toString("utf8")));
@@ -322,6 +323,9 @@ class JsonLineRpc {
   }
 
   request(command: Record<string, unknown>): Promise<unknown> {
+    if (this.fatalError) {
+      return Promise.reject(this.fatalError);
+    }
     const id = `req_${this.nextId}`;
     this.nextId += 1;
     return new Promise((resolve, reject) => {
@@ -358,7 +362,14 @@ class JsonLineRpc {
       const line = this.buffer.slice(0, newline).trim();
       this.buffer = this.buffer.slice(newline + 1);
       if (!line) continue;
-      const message = JSON.parse(line) as Record<string, unknown>;
+      let message: Record<string, unknown>;
+      try {
+        message = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        this.stderr += `${line}\n`;
+        this.failAll(new Error(`Pi RPC emitted malformed JSON on stdout: ${line}`));
+        return;
+      }
       if (message.type !== "response") {
         for (const subscriber of this.eventSubscribers) subscriber(message);
         continue;
@@ -378,6 +389,7 @@ class JsonLineRpc {
   }
 
   private failAll(error: Error): void {
+    this.fatalError = error;
     for (const pending of this.pending.values()) {
       pending.reject(error);
     }
