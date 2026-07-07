@@ -11,11 +11,18 @@ import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
 const root = await mkdtemp(join(tmpdir(), "devspace-workspace-test-"));
+const outsideRoot = await mkdtemp(join(tmpdir(), "devspace-workspace-outside-test-"));
 
 try {
   const agentDir = join(root, ".pi", "agent");
   await mkdir(agentDir, { recursive: true });
-  await writeFile(join(agentDir, "AGENTS.md"), "global instructions\n");
+  await mkdir(join(agentDir, "skills"), { recursive: true });
+  await writeFile(join(agentDir, "skills", "AGENTS.md"), "global instructions\n");
+  if (platform() === "win32") {
+    await writeFile(join(agentDir, "AGENTS.md"), "global instructions\n");
+  } else {
+    await symlink("skills/AGENTS.md", join(agentDir, "AGENTS.md"));
+  }
   await writeFile(join(root, "AGENTS.md"), "root instructions\n");
   await mkdir(join(root, ".devspace", "agents"), { recursive: true });
   await writeFile(
@@ -72,6 +79,26 @@ try {
       },
     ],
   );
+
+  if (platform() !== "win32") {
+    const unsafeAgentDir = join(root, ".pi", "unsafe-agent");
+    await mkdir(unsafeAgentDir, { recursive: true });
+    await writeFile(join(outsideRoot, "secret.txt"), "outside secret\n");
+    await symlink(join(outsideRoot, "secret.txt"), join(unsafeAgentDir, "AGENTS.md"));
+    const unsafeConfig = loadConfig({
+      DEVSPACE_CONFIG_DIR: join(root, ".devspace-unsafe-home"),
+      DEVSPACE_ALLOWED_ROOTS: root,
+      DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "unsafe-worktrees"),
+      DEVSPACE_AGENT_DIR: unsafeAgentDir,
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      PORT: "1",
+    });
+    const unsafeWorkspace = await new WorkspaceRegistry(unsafeConfig).openWorkspace(root);
+    assert.deepEqual(
+      unsafeWorkspace.agentsFiles.map((file) => file.content),
+      ["root instructions\n"],
+    );
+  }
 
   const missingWorkspaceRoot = join(root, "missing", "workspace");
   const missingWorkspace = await registry.openWorkspace(missingWorkspaceRoot);
@@ -155,6 +182,7 @@ try {
   }
 } finally {
   await rm(root, { recursive: true, force: true });
+  await rm(outsideRoot, { recursive: true, force: true });
 }
 
 async function git(cwd: string, args: string[]): Promise<void> {

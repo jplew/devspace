@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { WorkspaceMode, WorkspaceStore } from "./workspace-store.js";
-import { mkdir, opendir, stat } from "node:fs/promises";
+import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
@@ -220,7 +220,7 @@ export class WorkspaceRegistry {
       managed: workspace.worktree?.managed,
     });
     this.workspaces.set(workspace.id, workspace);
-    const agentsFiles = this.loadInitialAgentsFiles(workspace.root);
+    const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
 
     return { workspace, agentsFiles, availableAgentsFiles };
@@ -246,19 +246,23 @@ export class WorkspaceRegistry {
     return assertAllowedPath(root, this.config.allowedRoots);
   }
 
-  private loadInitialAgentsFiles(root: string): LoadedAgentsFile[] {
+  private async loadInitialAgentsFiles(root: string): Promise<LoadedAgentsFile[]> {
     const agentDir = resolve(this.config.agentDir);
+    const loadedFiles: LoadedAgentsFile[] = [];
 
-    return loadProjectContextFiles({ cwd: root, agentDir })
-      .filter((file) => {
-        const path = resolve(file.path);
-        if (isPathInsideRoot(path, agentDir)) return true;
-        return isPathInsideRoot(path, root) && dirname(path) === root;
-      })
-      .map((file) => ({
-        path: resolve(file.path),
-        content: file.content,
-      }));
+    for (const file of loadProjectContextFiles({ cwd: root, agentDir })) {
+      const path = resolve(file.path);
+      if (!isInitialAgentsFilePath(path, root, agentDir)) continue;
+      const content = await readResolvedContextFile(path, file.content, root, agentDir);
+      if (content === undefined) continue;
+
+      loadedFiles.push({
+        path,
+        content,
+      });
+    }
+
+    return loadedFiles;
   }
 
   private async findAvailableAgentsFiles(
@@ -266,12 +270,19 @@ export class WorkspaceRegistry {
     loadedFiles: LoadedAgentsFile[],
   ): Promise<AvailableAgentsFile[]> {
     const loadedPaths = new Set(loadedFiles.map((file) => resolve(file.path)));
+    const loadedRealPaths = new Set<string>();
+    for (const file of loadedFiles) {
+      const realPath = await tryRealpath(file.path);
+      if (realPath) loadedRealPaths.add(realPath);
+    }
     const discovered: AvailableAgentsFile[] = [];
 
     await walkWorkspace(root, async (path, entry) => {
       if (!entry.isFile()) return;
       if (!CONTEXT_FILE_NAMES.has(entry.name)) return;
       if (loadedPaths.has(path)) return;
+      const realPath = await tryRealpath(path);
+      if (realPath && loadedRealPaths.has(realPath)) return;
 
       discovered.push({ path });
     });
@@ -308,6 +319,34 @@ export function formatAgentsPath(path: string, workspaceRoot: string | undefined
   }
 
   return relationship.split(sep).join("/");
+}
+
+function isInitialAgentsFilePath(path: string, root: string, agentDir: string): boolean {
+  if (isPathInsideRoot(path, agentDir)) return true;
+  return isPathInsideRoot(path, root) && dirname(path) === root;
+}
+
+async function readResolvedContextFile(
+  path: string,
+  fallbackContent: string,
+  root: string,
+  agentDir: string,
+): Promise<string | undefined> {
+  try {
+    const resolvedPath = await realpath(path);
+    if (!isInitialAgentsFilePath(resolvedPath, root, agentDir)) return undefined;
+    return await readFile(resolvedPath, "utf8");
+  } catch {
+    return fallbackContent;
+  }
+}
+
+async function tryRealpath(path: string): Promise<string | undefined> {
+  try {
+    return await realpath(path);
+  } catch {
+    return undefined;
+  }
 }
 
 async function walkWorkspace(
