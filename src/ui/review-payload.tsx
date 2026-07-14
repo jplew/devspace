@@ -11,6 +11,7 @@ interface PayloadRendererOptions {
   hostContext?: HostContext;
   errorMessage?: string | null;
   visibleFileCount?: number;
+  presentation?: "inline" | "fullscreen";
 }
 
 interface MountedPayload {
