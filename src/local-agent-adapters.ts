@@ -1,17 +1,30 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
-import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  CanUseTool,
+  EffortLevel,
+  Options as ClaudeOptions,
+  Query,
+  SDKMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import {
   createCodexSdkLocalAgentRuntime,
+  LocalAgentRunController,
+  runLocalAgentHandle,
+  type LocalAgentRunHandle,
   type LocalAgentRunInput,
   type LocalAgentRunResult,
 } from "./local-agent-runtime.js";
+import { terminateProcessTreeGracefully } from "./process-platform.js";
+import type { EffectiveLocalAgentPolicy } from "./workflows/policy.js";
 
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
+  start(input: LocalAgentRunInput): Promise<LocalAgentRunHandle>;
   run(input: LocalAgentRunInput): Promise<LocalAgentRunResult>;
 }
 
@@ -19,13 +32,16 @@ const ACP_COMMANDS: Record<"cursor" | "copilot", [string, ...string[]]> = {
   cursor: ["cursor-agent", "acp"],
   copilot: ["copilot", "--acp"],
 };
+const MAX_RESULT_ITEMS = 256;
+const MAX_STDERR_CHARS = 16_384;
+const PROCESS_SHUTDOWN_GRACE_MS = 1_000;
 const PI_AGENT_TIMEOUT_MS = 120_000;
 
 export async function runLocalAgentProvider(
   provider: LocalAgentProvider,
   input: LocalAgentRunInput,
 ): Promise<LocalAgentRunResult> {
-  return createLocalAgentAdapter(provider).run(input);
+  return runLocalAgentHandle(await createLocalAgentAdapter(provider).start(input));
 }
 
 export function createLocalAgentAdapter(provider: LocalAgentProvider): LocalAgentAdapter {
@@ -44,74 +60,180 @@ export function createLocalAgentAdapter(provider: LocalAgentProvider): LocalAgen
   }
 }
 
-class CodexLocalAgentAdapter implements LocalAgentAdapter {
-  readonly provider = "codex" as const;
+abstract class BaseLocalAgentAdapter implements LocalAgentAdapter {
+  abstract readonly provider: LocalAgentProvider;
+  abstract start(input: LocalAgentRunInput): Promise<LocalAgentRunHandle>;
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
-    const runtime = await createCodexSdkLocalAgentRuntime();
-    return runtime.run(input);
+    return runLocalAgentHandle(await this.start(input));
   }
 }
 
-class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
+class CodexLocalAgentAdapter extends BaseLocalAgentAdapter {
+  readonly provider = "codex" as const;
+
+  async start(input: LocalAgentRunInput): Promise<LocalAgentRunHandle> {
+    const runtime = await createCodexSdkLocalAgentRuntime(
+      input.policy ? { env: { ...input.policy.environment } } : undefined,
+    );
+    return runtime.start(input);
+  }
+}
+
+export type ClaudeQueryLike = AsyncGenerator<SDKMessage, void> & Pick<Query, "interrupt" | "close">;
+export type ClaudeQueryFactory = (parameters: {
+  prompt: string;
+  options?: ClaudeOptions;
+}) => ClaudeQueryLike;
+
+export class ClaudeLocalAgentAdapter extends BaseLocalAgentAdapter {
   readonly provider = "claude" as const;
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
-    const { query } = await import("@anthropic-ai/claude-agent-sdk");
-    const claudeExecutable = process.env.CLAUDE_COMMAND ?? resolveExecutable("claude");
-    const messages = query({
+  constructor(private readonly queryFactory?: ClaudeQueryFactory) {
+    super();
+  }
+
+  async start(input: LocalAgentRunInput): Promise<LocalAgentRunHandle> {
+    const queryFactory = this.queryFactory ?? (await defaultClaudeQueryFactory());
+    const abortController = new AbortController();
+    const controller = new LocalAgentRunController(this.provider, input.signal);
+    const environment = input.policy?.environment ?? process.env;
+    const claudeExecutable = environment.CLAUDE_COMMAND ?? resolveExecutable("claude");
+    const policyOptions = claudePolicyOptions(input, controller);
+    const query = queryFactory({
       prompt: input.prompt,
       options: {
         cwd: input.workspace,
         model: input.model,
-        ...(input.thinking ? { thinking: { type: "adaptive" } as const, effort: input.thinking as EffortLevel } : {}),
+        ...(input.thinking
+          ? { thinking: { type: "adaptive" } as const, effort: input.thinking as EffortLevel }
+          : {}),
         resume: input.providerSessionId,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        env: claudeCommandEnvironment(process.env),
+        includePartialMessages: true,
+        abortController,
+        env: claudeCommandEnvironment(environment),
         ...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
+        ...policyOptions,
       },
     });
 
-    let providerSessionId = input.providerSessionId ?? null;
-    let finalResponse = "";
-    const items: unknown[] = [];
-    for await (const message of messages) {
-      items.push(message);
-      const record = message as Record<string, unknown>;
-      if (typeof record.session_id === "string") providerSessionId = record.session_id;
-      if (record.type === "result" && typeof record.result === "string") {
-        const resultError = claudeResultError(record);
-        if (resultError) throw new Error(resultError);
-        finalResponse = record.result;
+    const pump = (async () => {
+      let providerSessionId = input.providerSessionId ?? null;
+      let emittedSessionId: string | null = null;
+      let finalResponse = "";
+      const items: unknown[] = [];
+      try {
+        for await (const message of query) {
+          pushBounded(items, message);
+          if (message.session_id && message.session_id !== emittedSessionId) {
+            const sessionId = message.session_id;
+            providerSessionId = sessionId;
+            emittedSessionId = sessionId;
+            controller.emit({
+              type: "session",
+              providerSessionId: sessionId,
+              resumed: Boolean(input.providerSessionId),
+            });
+          }
+          emitClaudeMessage(controller, message);
+          if (message.type !== "result") continue;
+          if (message.subtype === "success") {
+            finalResponse = message.result;
+          } else {
+            throw new Error(
+              `Claude returned an error result (${message.subtype}): ${message.errors.join("; ") || "unknown error"}`,
+            );
+          }
+        }
+        controller.succeed({
+          provider: this.provider,
+          providerSessionId,
+          finalResponse: requireFinalResponse("Claude", finalResponse),
+          items,
+        });
+      } catch (error) {
+        controller.fail(error);
       }
-    }
+    })();
 
-    finalResponse = requireFinalResponse("Claude", finalResponse);
-    return {
-      provider: this.provider,
-      providerSessionId,
-      finalResponse,
-      items,
-    };
+    controller.setLifecycle({
+      cancel: async (reason) => {
+        await withTimeout(query.interrupt(), 1_000).catch(() => undefined);
+        abortController.abort(reason);
+      },
+      dispose: async () => {
+        abortController.abort();
+        query.close();
+      },
+      pump,
+    });
+    return controller;
   }
 }
 
-function claudeResultError(record: Record<string, unknown>): string | undefined {
-  const subtype = typeof record.subtype === "string" ? record.subtype : undefined;
-  const isError = record.is_error === true || subtype?.startsWith("error");
-  if (!isError) return undefined;
-  const message =
-    directString(record.error) ??
-    directString(record.message) ??
-    directString(record.result) ??
-    subtype ??
-    "Claude returned an error result.";
-  return `Claude returned an error result: ${message}`;
+async function defaultClaudeQueryFactory(): Promise<ClaudeQueryFactory> {
+  const module = await import("@anthropic-ai/claude-agent-sdk");
+  return module.query as ClaudeQueryFactory;
 }
 
-function directString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+function claudePolicyOptions(
+  input: LocalAgentRunInput,
+  controller: LocalAgentRunController,
+): Partial<ClaudeOptions> {
+  if (input.policy?.mode !== "workflow") {
+    return {
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+    };
+  }
+
+  const writable = input.policy.access === "workspace_write";
+  const allowedTools = new Set(writable
+    ? ["Read", "Glob", "Grep", "Edit", "Write", "NotebookEdit"]
+    : ["Read", "Glob", "Grep"]);
+  const canUseTool: CanUseTool = async (toolName, toolInput) => {
+    controller.emit({ type: "permission", phase: "requested", tool: toolName });
+    const path = directString(toolInput.file_path) ??
+      directString(toolInput.notebook_path) ??
+      directString(toolInput.path);
+    const pathAllowed = !path || await isCanonicalPathInsideWorkspace(input.workspace, path);
+    if (allowedTools.has(toolName) && pathAllowed) {
+      controller.emit({ type: "permission", phase: "allowed", tool: toolName });
+      return { behavior: "allow", updatedInput: toolInput };
+    }
+    controller.emit({ type: "permission", phase: "denied", tool: toolName });
+    return { behavior: "deny", message: "Tool is not permitted by workflow policy." };
+  };
+  return {
+    permissionMode: "dontAsk",
+    tools: [...allowedTools],
+    canUseTool,
+    sandbox: { enabled: true, failIfUnavailable: true },
+    settingSources: [],
+    strictMcpConfig: true,
+    mcpServers: {},
+    plugins: [],
+    skills: [],
+    agents: {},
+  };
+}
+
+function emitClaudeMessage(controller: LocalAgentRunController, message: SDKMessage): void {
+  if (message.type === "stream_event") {
+    const event = asRecord(message.event);
+    const delta = asRecord(event?.delta);
+    if (event?.type === "content_block_delta" && delta?.type === "text_delta" && typeof delta.text === "string") {
+      controller.emit({ type: "output", stream: "assistant", delta: delta.text });
+    } else if (event?.type === "content_block_delta" && delta?.type === "thinking_delta" && typeof delta.thinking === "string") {
+      controller.emit({ type: "output", stream: "thinking", delta: delta.thinking });
+    }
+    return;
+  }
+  if (message.type === "tool_progress") {
+    controller.emit({ type: "tool", phase: "updated", name: message.tool_name, id: message.tool_use_id });
+  } else if (message.type === "permission_denied") {
+    controller.emit({ type: "permission", phase: "denied", tool: message.tool_name });
+  }
 }
 
 function resolveExecutable(command: string): string | undefined {
@@ -125,7 +247,7 @@ function resolveExecutable(command: string): string | undefined {
   return executable?.trim() || undefined;
 }
 
-export function claudeCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function claudeCommandEnvironment(env: NodeJS.ProcessEnv | Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   const next = { ...env };
   for (const key of [
     "CLAUDECODE",
@@ -138,111 +260,313 @@ export function claudeCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.Process
   return next;
 }
 
-class OpencodeLocalAgentAdapter implements LocalAgentAdapter {
+class OpencodeLocalAgentAdapter extends BaseLocalAgentAdapter {
   readonly provider = "opencode" as const;
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
-    const { createOpencode } = await import("@opencode-ai/sdk/v2");
-    const { client, server } = await createOpencode();
-    try {
-      const sessionId = input.providerSessionId ?? await createOpencodeSession(client, input);
-      const promptResult = await promptOpencodeSession(client, sessionId, input);
-      await waitForOpencodeSession(client, sessionId);
-      const messages = await readOpencodeMessages(client, sessionId);
-      const finalResponse = requireFinalResponse(
-        "OpenCode",
-        extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
-      );
-      return {
-        provider: this.provider,
-        providerSessionId: sessionId,
-        finalResponse,
-        items: [promptResult, messages],
-      };
-    } finally {
-      server.close();
+  async start(input: LocalAgentRunInput): Promise<LocalAgentRunHandle> {
+    if (input.policy?.mode === "workflow") {
+      throw new Error("OpenCode cannot currently enforce DevSpace workflow filesystem policy.");
     }
+    const { createOpencode } = await import("@opencode-ai/sdk/v2");
+    const abortController = new AbortController();
+    const controller = new LocalAgentRunController(this.provider, input.signal);
+    const { client, server } = await createOpencode({ signal: abortController.signal });
+    const session = client.v2.session;
+    let subscriptionStream: AsyncGenerator<unknown> | undefined;
+    let sessionId: string | undefined;
+
+    const pump = (async () => {
+      const items: unknown[] = [];
+      try {
+        sessionId = input.providerSessionId ?? await createOpencodeSession(client, input);
+        if (input.providerSessionId) {
+          await session.get({ sessionID: sessionId }, { throwOnError: true });
+          if (input.model) {
+            await session.switchModel(
+              { sessionID: sessionId, model: parseOpencodeV2Model(input.model, input.thinking) },
+              { throwOnError: true },
+            );
+          }
+        }
+        controller.emit({
+          type: "session",
+          providerSessionId: sessionId,
+          resumed: Boolean(input.providerSessionId),
+        });
+        const subscription = await client.v2.event.subscribe({
+          signal: abortController.signal,
+          sseMaxRetryAttempts: 1,
+          onSseError: (error: unknown) => {
+            controller.emit({ type: "warning", message: `OpenCode event stream error: ${errorMessage(error)}` });
+          },
+        });
+        subscriptionStream = subscription.stream as AsyncGenerator<unknown>;
+        const eventPump = (async () => {
+          for await (const event of subscriptionStream ?? []) {
+            if (!isOpencodeSessionEvent(event, sessionId as string)) continue;
+            pushBounded(items, event);
+            emitOpencodeEvent(controller, event);
+          }
+        })();
+        const promptResult = await session.prompt({
+          sessionID: sessionId,
+          prompt: { text: input.prompt },
+          delivery: "queue",
+          resume: true,
+        }, { throwOnError: true });
+        pushBounded(items, promptResult);
+        await session.wait({ sessionID: sessionId }, { throwOnError: true });
+        const messages = await session.messages(
+          { sessionID: sessionId, order: "desc", limit: 100 },
+          { throwOnError: true },
+        );
+        pushBounded(items, messages);
+        abortController.abort();
+        await eventPump.catch(() => undefined);
+        const finalResponse = requireFinalResponse("OpenCode", extractOpenCodeFinalResponse(promptResult));
+        controller.succeed({
+          provider: this.provider,
+          providerSessionId: sessionId,
+          finalResponse,
+          items,
+        });
+      } catch (error) {
+        controller.fail(error);
+      }
+    })();
+
+    controller.setLifecycle({
+      cancel: async () => {
+        if (sessionId) {
+          await session.interrupt({ sessionID: sessionId }, { throwOnError: true }).catch(() => undefined);
+        }
+        abortController.abort();
+      },
+      dispose: async () => {
+        abortController.abort();
+        await subscriptionStream?.return(undefined).catch(() => undefined);
+        server.close();
+      },
+      pump,
+    });
+    return controller;
   }
 }
 
-class AcpLocalAgentAdapter implements LocalAgentAdapter {
+class AcpLocalAgentAdapter extends BaseLocalAgentAdapter {
   constructor(
     readonly provider: "cursor" | "copilot",
     private readonly command: [string, ...string[]],
-  ) {}
+  ) {
+    super();
+  }
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
-    const { client } = await import("@agentclientprotocol/sdk");
-    const { methods } = await import("@agentclientprotocol/sdk");
-    const { ndJsonStream } = await import("@agentclientprotocol/sdk");
+  async start(input: LocalAgentRunInput): Promise<LocalAgentRunHandle> {
+    if (input.policy?.mode === "workflow") {
+      throw new Error(`${this.provider} ACP cannot currently enforce DevSpace workflow filesystem policy.`);
+    }
+    const { client, methods, ndJsonStream, PROTOCOL_VERSION } = await import("@agentclientprotocol/sdk");
     const [command, ...args] = this.command;
+    const detached = process.platform !== "win32";
     const child = spawn(command, args, {
       cwd: input.workspace,
-      env: process.env,
+      env: { ...(input.policy?.environment ?? process.env) },
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      detached,
     });
     assertPipedChild(child);
+    const controller = new LocalAgentRunController(this.provider, input.signal);
     let stderr = "";
+    let context: { notify(method: string, params: unknown): Promise<void> } | undefined;
+    let providerSessionId = input.providerSessionId ?? null;
+    let replaying = Boolean(input.providerSessionId);
+    let disposing = false;
+    const items: unknown[] = [];
+    const textParts: string[] = [];
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
+      stderr = appendBounded(stderr, chunk.toString("utf8"));
     });
-
     const stream = ndJsonStream(
       Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
-    try {
-      let providerSessionId = input.providerSessionId ?? null;
-      const finalResponse = await client({ name: "DevSpace" })
-        .onRequest(methods.client.session.requestPermission, (context) => {
-          const selected = selectAcpAllowPermissionOption(context.params.options);
-          return selected
-            ? { outcome: { outcome: "selected", optionId: selected.optionId } }
-            : { outcome: { outcome: "cancelled" } };
-        })
-        .connectWith(stream, async (context) => {
-          const session = await context.buildSession(input.workspace).start();
-          providerSessionId = session.sessionId;
-          try {
-            if (input.model) {
-              const config = resolveAcpModelConfigUpdate(session, input.model, this.provider);
-              await context.request(methods.agent.session.setConfigOption, config);
-            }
-            if (input.thinking) {
-              const config = resolveAcpThinkingConfigUpdate(session, input.thinking, this.provider);
-              await context.request(methods.agent.session.setConfigOption, config);
-            }
-            const prompt = session.prompt(input.prompt);
-            const textParts: string[] = [];
-            for (;;) {
-              const message = await session.nextUpdate();
-              if (message.kind === "stop") {
-                await prompt;
-                return textParts.join("").trim();
-              }
-
-              const update = message.update;
-              if (update.sessionUpdate !== "agent_message_chunk") continue;
-              const content = update.content;
-              if (content.type === "text") textParts.push(content.text);
-            }
-          } finally {
-            session.dispose();
-          }
+    const app = client({ name: "DevSpace" })
+      .onRequest(methods.client.session.requestPermission, ({ params }) => {
+        const tool = asRecord(params.toolCall)?.kind as string | undefined;
+        controller.emit({ type: "permission", phase: "requested", tool });
+        const outcome = resolveAcpPermissionRequest(params, input.policy);
+        controller.emit({
+          type: "permission",
+          phase: outcome.response.outcome.outcome === "selected" && outcome.allowed ? "allowed" : "denied",
+          tool,
         });
-      return {
-        provider: this.provider,
-        providerSessionId,
-        finalResponse: finalResponse.trim(),
-        items: [],
-      };
-    } catch (error) {
-      throw new Error(`${this.provider} ACP run failed: ${errorMessage(error)}${stderr ? `\n${stderr.trim()}` : ""}`);
-    } finally {
-      child.kill();
-    }
+        return outcome.response;
+      })
+      .onNotification(methods.client.session.update, ({ params }) => {
+        if (params.sessionId !== providerSessionId || replaying) return;
+        pushBounded(items, params);
+        emitAcpUpdate(controller, params.update, textParts);
+      });
+
+    const pump = app.connectWith(stream, async (activeContext) => {
+      context = activeContext;
+      try {
+        const initialized = await activeContext.request(methods.agent.initialize, {
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: {},
+          clientInfo: { name: "DevSpace", version: "1" },
+        });
+        if (initialized.protocolVersion !== PROTOCOL_VERSION) {
+          throw new Error(`${this.provider} ACP protocol version ${initialized.protocolVersion} is unsupported.`);
+        }
+        let sessionResponse: unknown;
+        if (input.providerSessionId) {
+          const capabilities = asRecord(initialized.agentCapabilities);
+          if (capabilities?.loadSession !== true) {
+            throw new Error(`${this.provider} ACP does not support loading persisted sessions.`);
+          }
+          sessionResponse = await activeContext.request(methods.agent.session.load, {
+            sessionId: input.providerSessionId,
+            cwd: input.workspace,
+            mcpServers: [],
+          });
+          providerSessionId = input.providerSessionId;
+          replaying = false;
+        } else {
+          sessionResponse = await activeContext.request(methods.agent.session.new, {
+            cwd: input.workspace,
+            mcpServers: [],
+          });
+          providerSessionId = directString(asRecord(sessionResponse)?.sessionId) ?? null;
+        }
+        if (!providerSessionId) throw new Error(`${this.provider} ACP did not return a session id.`);
+        const sessionId = providerSessionId;
+        controller.emit({
+          type: "session",
+          providerSessionId: sessionId,
+          resumed: Boolean(input.providerSessionId),
+        });
+        let sessionMetadata = { sessionId, newSessionResponse: sessionResponse };
+        if (input.model) {
+          const config = resolveAcpModelConfigUpdate(sessionMetadata, input.model, this.provider);
+          const response = await activeContext.request(methods.agent.session.setConfigOption, config);
+          sessionMetadata = { sessionId, newSessionResponse: response };
+        }
+        if (input.thinking) {
+          const config = resolveAcpThinkingConfigUpdate(sessionMetadata, input.thinking, this.provider);
+          const response = await activeContext.request(methods.agent.session.setConfigOption, config);
+          sessionMetadata = { sessionId, newSessionResponse: response };
+        }
+        const promptResponse = asRecord(await activeContext.request(methods.agent.session.prompt, {
+          sessionId,
+          prompt: [{ type: "text", text: input.prompt }],
+        }));
+        const stopReason = directString(promptResponse?.stopReason);
+        if (stopReason !== "end_turn") {
+          throw new Error(`${this.provider} ACP stopped with ${stopReason ?? "unknown"}.`);
+        }
+        controller.succeed({
+          provider: this.provider,
+          providerSessionId: sessionId,
+          finalResponse: requireFinalResponse(this.provider, textParts.join("")),
+          items,
+        });
+      } catch (error) {
+        if (!disposing) {
+          const suffix = stderr.trim() ? `\n${stderr.trim()}` : "";
+          controller.fail(new Error(`${this.provider} ACP run failed: ${errorMessage(error)}${suffix}`));
+        }
+      }
+    });
+
+    child.once("error", (error) => controller.fail(error));
+    child.once("exit", (code, signal) => {
+      if (!disposing && code !== 0) {
+        controller.fail(new Error(`${this.provider} ACP process exited with code ${code ?? "null"} and signal ${signal ?? "null"}.`));
+      }
+    });
+    controller.setLifecycle({
+      cancel: async () => {
+        if (context && providerSessionId) {
+          await context.notify(methods.agent.session.cancel, { sessionId: providerSessionId }).catch(() => undefined);
+        }
+        disposing = true;
+        await terminateProcessTreeGracefully(child, detached, PROCESS_SHUTDOWN_GRACE_MS);
+      },
+      dispose: async () => {
+        disposing = true;
+        await terminateProcessTreeGracefully(child, detached, PROCESS_SHUTDOWN_GRACE_MS);
+      },
+      pump: pump.then(() => undefined).catch((error) => controller.fail(error)),
+    });
+    return controller;
   }
+}
+
+export function resolveAcpPermissionRequest(
+  params: { toolCall: unknown; options: Array<{ optionId: string; kind: string }> },
+  policy?: EffectiveLocalAgentPolicy,
+): {
+  allowed: boolean;
+  outcome: { outcome: { outcome: string; optionId?: string } };
+  response: { outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" } };
+} {
+  const toolKind = directString(asRecord(params.toolCall)?.kind) ?? "other";
+  const compatibility = policy?.mode !== "workflow";
+  const readOnlyKinds = new Set(["read", "search", "fetch", "think"]);
+  const workspaceWriteKinds = new Set([...readOnlyKinds, "edit", "delete", "move"]);
+  const allowed = compatibility || (policy?.access === "workspace_write"
+    ? workspaceWriteKinds.has(toolKind)
+    : readOnlyKinds.has(toolKind));
+  const desiredKinds = allowed
+    ? compatibility ? ["allow_once", "allow_always"] : ["allow_once"]
+    : ["reject_once", "reject_always"];
+  const selected = desiredKinds
+    .map((kind) => params.options.find((option) => option.kind === kind))
+    .find((option) => option !== undefined);
+  if (!selected) {
+    const response = { outcome: { outcome: "cancelled" as const } };
+    return { allowed: false, outcome: response, response };
+  }
+  const response = { outcome: { outcome: "selected" as const, optionId: selected.optionId } };
+  return { allowed, outcome: response, response };
+}
+
+function emitAcpUpdate(
+  controller: LocalAgentRunController,
+  update: unknown,
+  textParts: string[],
+): void {
+  const record = asRecord(update);
+  const kind = directString(record?.sessionUpdate);
+  if (kind === "agent_message_chunk") {
+    const content = asRecord(record?.content);
+    if (content?.type === "text" && typeof content.text === "string") {
+      textParts.push(content.text);
+      controller.emit({ type: "output", stream: "assistant", delta: content.text });
+    }
+  } else if (kind === "agent_thought_chunk") {
+    const content = asRecord(record?.content);
+    if (content?.type === "text" && typeof content.text === "string") {
+      controller.emit({ type: "output", stream: "thinking", delta: content.text });
+    }
+  } else if (kind === "tool_call" || kind === "tool_call_update") {
+    controller.emit({
+      type: "tool",
+      phase: kind === "tool_call" ? "started" : acpToolPhase(record?.status),
+      id: directString(record?.toolCallId),
+      name: directString(record?.title) ?? directString(record?.kind),
+    });
+  } else if (kind) {
+    controller.emit({ type: "warning", message: `ACP update: ${kind}` });
+  }
+}
+
+function acpToolPhase(status: unknown): "updated" | "completed" | "failed" {
+  if (status === "completed") return "completed";
+  if (status === "failed") return "failed";
+  return "updated";
 }
 
 export function resolveAcpModelConfigUpdate(
@@ -323,63 +647,116 @@ function flattenAcpSelectValues(option: Record<string, unknown>): string[] {
   return values;
 }
 
-function selectAcpAllowPermissionOption(options: Array<{ optionId: string; kind: string }>): { optionId: string } | undefined {
-  return (
-    options.find((option) => option.kind === "allow_once") ??
-    options.find((option) => option.kind === "allow_always")
-  );
-}
-
-class PiRpcLocalAgentAdapter implements LocalAgentAdapter {
+class PiRpcLocalAgentAdapter extends BaseLocalAgentAdapter {
   readonly provider = "pi" as const;
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+  async start(input: LocalAgentRunInput): Promise<LocalAgentRunHandle> {
+    if (input.policy?.mode === "workflow") {
+      throw new Error("Pi RPC cannot currently enforce DevSpace workflow filesystem policy.");
+    }
     const args = ["--mode", "rpc"];
     if (input.model) args.push("--model", input.model);
     if (input.thinking) args.push("--thinking", input.thinking);
     if (input.providerSessionId) args.push("--session", input.providerSessionId);
-    const child = spawn(process.env.PI_COMMAND ?? "pi", args, {
+    const detached = process.platform !== "win32";
+    const environment = input.policy?.environment ?? process.env;
+    const child = spawn(environment.PI_COMMAND ?? "pi", args, {
       cwd: input.workspace,
-      env: piCommandEnvironment(process.env),
+      env: piCommandEnvironment(environment),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      detached,
     });
     assertPipedChild(child);
+    const controller = new LocalAgentRunController(this.provider, input.signal);
     const rpc = new JsonLineRpc(child);
     const events: unknown[] = [];
-    rpc.onEvent((event) => events.push(event));
-    try {
-      const state = await rpc.request({ type: "get_state" });
-      const providerSessionId = readNestedString(state, ["sessionId"]) ?? input.providerSessionId ?? null;
-      const done = rpc.waitForEvent((event) => asRecord(event)?.type === "agent_end", PI_AGENT_TIMEOUT_MS);
-      await rpc.request({ type: "prompt", message: input.prompt });
-      const agentEnd = await done;
-      const sessionMessages = await rpc.request({ type: "get_messages" });
-      const finalResponse =
-        extractPiFinalResponse(agentEnd) ||
-        extractPiFinalResponse(sessionMessages) ||
-        extractPiStreamingText(events);
-      if (!finalResponse) {
+    let disposing = false;
+    rpc.onEvent((event) => {
+      pushBounded(events, event);
+      emitPiEvent(controller, event);
+    });
+
+    const pump = (async () => {
+      try {
+        const state = await rpc.request({ type: "get_state" });
+        const providerSessionId = readNestedString(state, ["sessionId"]) ?? input.providerSessionId ?? null;
+        if (providerSessionId) {
+          controller.emit({
+            type: "session",
+            providerSessionId,
+            resumed: Boolean(input.providerSessionId),
+          });
+        }
+        const done = rpc.waitForEvent((event) => {
+          const record = asRecord(event);
+          return record?.type === "agent_end" && record.willRetry !== true;
+        }, PI_AGENT_TIMEOUT_MS);
+        await rpc.request({ type: "prompt", message: input.prompt });
+        const agentEnd = await done;
+        const sessionMessages = await rpc.request({ type: "get_messages" });
         const providerError =
           extractPiProviderError(agentEnd) ||
           extractPiProviderError(sessionMessages) ||
           extractPiProviderError(events);
         if (providerError) throw new Error(`Pi returned an error: ${providerError}`);
+        const finalResponse = requireFinalResponse(
+          "Pi",
+          extractPiFinalResponse(agentEnd) ||
+            extractPiFinalResponse(sessionMessages) ||
+            extractPiStreamingText(events),
+        );
+        pushBounded(events, sessionMessages);
+        controller.succeed({
+          provider: this.provider,
+          providerSessionId,
+          finalResponse,
+          items: events,
+        });
+      } catch (error) {
+        if (!disposing) controller.fail(error);
       }
-      requireFinalResponse("Pi", finalResponse);
-      return {
-        provider: this.provider,
-        providerSessionId,
-        finalResponse,
-        items: [...events, sessionMessages],
-      };
-    } finally {
-      child.kill();
-    }
+    })();
+
+    controller.setLifecycle({
+      cancel: async () => {
+        await withTimeout(rpc.request({ type: "abort" }), 500).catch(() => undefined);
+        disposing = true;
+        await terminateProcessTreeGracefully(child, detached, PROCESS_SHUTDOWN_GRACE_MS);
+      },
+      dispose: async () => {
+        disposing = true;
+        await terminateProcessTreeGracefully(child, detached, PROCESS_SHUTDOWN_GRACE_MS);
+      },
+      pump,
+    });
+    return controller;
   }
 }
 
-export function piCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+function emitPiEvent(controller: LocalAgentRunController, event: unknown): void {
+  const record = asRecord(event);
+  if (!record) return;
+  if (record.type === "message_update") {
+    const update = asRecord(record.assistantMessageEvent);
+    if (update?.type === "text_delta" && typeof update.delta === "string") {
+      controller.emit({ type: "output", stream: "assistant", delta: update.delta });
+    } else if (update?.type === "thinking_delta" && typeof update.delta === "string") {
+      controller.emit({ type: "output", stream: "thinking", delta: update.delta });
+    }
+  } else if (record.type === "tool_execution_start" || record.type === "tool_execution_update" || record.type === "tool_execution_end") {
+    controller.emit({
+      type: "tool",
+      phase: record.type === "tool_execution_start" ? "started" : record.type === "tool_execution_end" ? "completed" : "updated",
+      id: directString(record.toolCallId),
+      name: directString(record.toolName),
+    });
+  } else if (record.type === "extension_error") {
+    controller.emit({ type: "warning", message: directString(record.message) ?? "Pi extension error." });
+  }
+}
+
+export function piCommandEnvironment(env: NodeJS.ProcessEnv | Readonly<Record<string, string>>): NodeJS.ProcessEnv {
   if (env.PI_COMMAND) return env;
   const path = env.PATH;
   if (!path) return env;
@@ -396,6 +773,7 @@ class JsonLineRpc {
     reject: (error: Error) => void;
   }>();
   private readonly eventSubscribers = new Set<(event: unknown) => void>();
+  private readonly eventWaiterRejectors = new Set<(error: Error) => void>();
   private buffer = "";
   private nextId = 1;
   private stderr = "";
@@ -404,8 +782,9 @@ class JsonLineRpc {
   constructor(private readonly child: ChildProcessWithoutNullStreams) {
     child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk.toString("utf8")));
     child.stderr.on("data", (chunk: Buffer) => {
-      this.stderr += chunk.toString("utf8");
+      this.stderr = appendBounded(this.stderr, chunk.toString("utf8"));
     });
+    child.on("error", (error) => this.failAll(error));
     child.on("exit", (code, signal) => {
       this.failAll(new Error(`Pi RPC process exited with code ${code ?? "null"} and signal ${signal ?? "null"}\n${this.stderr}`.trim()));
     });
@@ -429,17 +808,26 @@ class JsonLineRpc {
   }
 
   waitForEvent(predicate: (event: unknown) => boolean, timeoutMs: number): Promise<unknown> {
+    if (this.fatalError) return Promise.reject(this.fatalError);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const finish = () => {
+        clearTimeout(timer);
         unsubscribe();
-        reject(new Error(`Pi RPC timed out waiting for agent completion\n${this.stderr}`.trim()));
+        this.eventWaiterRejectors.delete(rejectWaiter);
+      };
+      const rejectWaiter = (error: Error) => {
+        finish();
+        reject(error);
+      };
+      const timer = setTimeout(() => {
+        rejectWaiter(new Error(`Pi RPC timed out waiting for agent completion\n${this.stderr}`.trim()));
       }, timeoutMs);
       const unsubscribe = this.onEvent((event) => {
         if (!predicate(event)) return;
-        clearTimeout(timer);
-        unsubscribe();
+        finish();
         resolve(event);
       });
+      this.eventWaiterRejectors.add(rejectWaiter);
     });
   }
 
@@ -455,7 +843,7 @@ class JsonLineRpc {
       try {
         message = JSON.parse(line) as Record<string, unknown>;
       } catch {
-        this.stderr += `${line}\n`;
+        this.stderr = appendBounded(this.stderr, `${line}\n`);
         this.failAll(new Error(`Pi RPC emitted malformed JSON on stdout: ${line}`));
         return;
       }
@@ -478,82 +866,60 @@ class JsonLineRpc {
   }
 
   private failAll(error: Error): void {
+    if (this.fatalError) return;
     this.fatalError = error;
-    for (const pending of this.pending.values()) {
-      pending.reject(error);
-    }
+    for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
+    for (const reject of this.eventWaiterRejectors) reject(error);
+    this.eventWaiterRejectors.clear();
   }
 }
 
 async function createOpencodeSession(client: unknown, input: LocalAgentRunInput): Promise<string> {
-  const sessionClient = client as {
-    session: {
-      create(parameters?: unknown, options?: unknown): Promise<unknown>;
+  const session = (client as {
+    v2: {
+      session: {
+        create(parameters?: unknown, options?: unknown): Promise<unknown>;
+      };
     };
-  };
-  const result = await sessionClient.session.create({
-    directory: input.workspace,
+  }).v2.session;
+  const result = await session.create({
     location: { directory: input.workspace },
-    ...(input.model ? { model: parseOpencodeModel(input.model) } : {}),
+    ...(input.model ? { model: parseOpencodeV2Model(input.model, input.thinking) } : {}),
   }, { throwOnError: true });
   const id =
-    readNestedString(result, ["id"]) ??
+    readNestedString(result, ["data", "data", "id"]) ??
     readNestedString(result, ["data", "id"]) ??
-    readNestedString(result, ["session", "id"]) ??
-    readNestedString(result, ["data", "session", "id"]);
-  if (typeof id !== "string") {
-    throw new Error("OpenCode did not return a session id.");
-  }
+    readNestedString(result, ["id"]);
+  if (!id) throw new Error("OpenCode did not return a session id.");
   return id;
 }
 
-async function promptOpencodeSession(
-  client: unknown,
-  sessionId: string,
-  input: LocalAgentRunInput,
-): Promise<unknown> {
-  const session = (client as {
-    session: {
-      prompt(parameters?: unknown, options?: unknown): Promise<unknown>;
-    };
-  }).session;
-  const promptInput = {
-    sessionID: sessionId,
-    directory: input.workspace,
-    prompt: { parts: [{ type: "text", text: input.prompt }] },
-    parts: [{ type: "text", text: input.prompt }],
-    ...(input.model ? { model: parseOpencodeModel(input.model) } : {}),
-    ...(input.thinking ? { variant: input.thinking } : {}),
-  };
-  return session.prompt(promptInput, { throwOnError: true });
-}
-
-async function waitForOpencodeSession(client: unknown, sessionId: string): Promise<void> {
-  const session = (client as {
-    session?: { wait?: (parameters?: unknown, options?: unknown) => Promise<unknown> };
-  }).session;
-  if (!session?.wait) return;
-  await session.wait({ sessionID: sessionId }, { throwOnError: true });
-}
-
-async function readOpencodeMessages(client: unknown, sessionId: string): Promise<unknown> {
-  const session = (client as {
-    session?: {
-      messages?: (parameters?: unknown, options?: unknown) => Promise<unknown>;
-    };
-  }).session;
-  if (!session?.messages) return undefined;
-  return session.messages({ sessionID: sessionId, order: "asc", limit: 100 }, { throwOnError: true });
-}
-
-function parseOpencodeModel(model: string): { providerID: string; modelID: string } {
+function parseOpencodeV2Model(
+  model: string,
+  variant?: string,
+): { providerID: string; id: string; variant?: string } {
   const separator = model.indexOf("/");
-  if (separator === -1) return { providerID: "opencode", modelID: model };
-  return {
-    providerID: model.slice(0, separator),
-    modelID: model.slice(separator + 1),
-  };
+  const parsed = separator === -1
+    ? { providerID: "opencode", id: model }
+    : { providerID: model.slice(0, separator), id: model.slice(separator + 1) };
+  return variant ? { ...parsed, variant } : parsed;
+}
+
+function isOpencodeSessionEvent(event: unknown, sessionId: string): boolean {
+  const data = asRecord(asRecord(event)?.data);
+  const eventSessionId = directString(data?.sessionID);
+  return !eventSessionId || eventSessionId === sessionId;
+}
+
+function emitOpencodeEvent(controller: LocalAgentRunController, event: unknown): void {
+  const record = asRecord(event);
+  const data = asRecord(record?.data);
+  if (record?.type === "session.next.text.delta" && typeof data?.delta === "string") {
+    controller.emit({ type: "output", stream: "assistant", delta: data.delta });
+  } else if (record?.type === "session.next.step.failed" || record?.type === "session.error") {
+    controller.emit({ type: "warning", message: `OpenCode event: ${record.type}` });
+  }
 }
 
 export function extractLocalAgentResponseText(value: unknown): string {
@@ -690,9 +1056,15 @@ function stringifyStructuredAssistantMessage(value: unknown): string {
 }
 
 function unwrapProviderPayload(value: unknown): unknown {
-  const record = asRecord(value);
-  if (!record) return value;
-  return record.data ?? record.result ?? value;
+  let current = value;
+  for (let depth = 0; depth < 4; depth += 1) {
+    const record = asRecord(current);
+    if (!record) return current;
+    const next = record.data ?? record.result;
+    if (next === undefined || next === current) return current;
+    current = next;
+  }
+  return current;
 }
 
 function readArray(record: unknown, key: string): unknown[] | undefined {
@@ -711,6 +1083,62 @@ function readNestedString(value: unknown, path: string[]): string | undefined {
     current = asRecord(current)?.[key];
   }
   return typeof current === "string" ? current : undefined;
+}
+
+function directString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function pushBounded(items: unknown[], item: unknown): void {
+  if (items.length >= MAX_RESULT_ITEMS) items.shift();
+  items.push(item);
+}
+
+function appendBounded(current: string, addition: string): string {
+  const combined = current + addition;
+  return combined.length > MAX_STDERR_CHARS
+    ? combined.slice(combined.length - MAX_STDERR_CHARS)
+    : combined;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Provider operation timed out.")), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function isCanonicalPathInsideWorkspace(workspace: string, candidate: string): Promise<boolean> {
+  let canonicalWorkspace: string;
+  try {
+    canonicalWorkspace = await realpath(workspace);
+  } catch {
+    return false;
+  }
+
+  let existingPath = isAbsolute(candidate) ? resolve(candidate) : resolve(workspace, candidate);
+  for (;;) {
+    try {
+      const canonicalCandidate = await realpath(existingPath);
+      const path = relative(canonicalWorkspace, canonicalCandidate);
+      return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return false;
+      const parent = dirname(existingPath);
+      if (parent === existingPath) return false;
+      existingPath = parent;
+    }
+  }
 }
 
 function errorMessage(error: unknown): string {
