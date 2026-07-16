@@ -28,6 +28,7 @@ import {
   type WorkflowSupervisorRecord,
   type WorkflowTransition,
   type WorkflowWorkspaceScope,
+  type WorkflowWorktreeRecord,
 } from "./types.js";
 
 const MAX_EVENT_PAYLOAD_BYTES = 64 * 1024;
@@ -35,6 +36,10 @@ const DEFAULT_EVENT_LIMIT = 100;
 const MAX_EVENT_LIMIT = 1_000;
 const DEFAULT_CLAIM_LEASE_MS = 5 * 60_000;
 const MAX_CLAIM_LEASE_MS = 24 * 60 * 60_000;
+const MAX_WORKFLOW_NODES = 64;
+const MAX_WORKFLOW_EDGES = 256;
+const MAX_RUN_CONCURRENCY = 16;
+const SAFE_NODE_KEY = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 
 const TERMINAL_WORKFLOW_STATUSES = new Set<WorkflowStatus>([
   "succeeded",
@@ -78,6 +83,8 @@ interface WorkflowRunRow {
   request_hash: string;
   workspace_id: string | null;
   workspace_root: string | null;
+  max_concurrency: number;
+  last_dispatched_at: string | null;
   result_json: string | null;
   error_json: string | null;
   cancellation_requested_at: string | null;
@@ -98,6 +105,7 @@ interface WorkflowNodeRow {
   claim_token: string | null;
   claimed_at: string | null;
   claim_expires_at: string | null;
+  next_eligible_at: string | null;
   supervisor_owner_token: string | null;
   supervisor_owner_epoch: number | null;
   heartbeat_at: string | null;
@@ -134,6 +142,20 @@ interface WorkflowSupervisorRow {
   heartbeat_at: string | null;
   wake_generation: number;
   started_at: string | null;
+}
+
+interface WorkflowWorktreeRow {
+  workflow_run_id: string;
+  node_key: string;
+  attempt: number;
+  path: string;
+  source_root: string;
+  base_sha: string;
+  state: WorkflowWorktreeRecord["state"];
+  retain_until: string | null;
+  cleanup_error: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 interface WorkflowAttemptRow {
@@ -215,8 +237,9 @@ export class WorkflowStore {
         .prepare(
           `insert into workflow_runs (
             id, definition_version, status, definition_json, input_json, policy_json,
-            idempotency_key, request_hash, workspace_id, workspace_root, created_at, updated_at
-          ) values (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            idempotency_key, request_hash, workspace_id, workspace_root, max_concurrency,
+            created_at, updated_at
+          ) values (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           workflowId,
@@ -228,6 +251,7 @@ export class WorkflowStore {
           normalized.requestHash,
           normalized.workspace?.workspaceId ?? null,
           normalized.workspace?.workspaceRoot ?? null,
+          normalized.maxConcurrency,
           now,
           now,
         );
@@ -663,16 +687,23 @@ export class WorkflowStore {
           `select n.* from workflow_nodes n
            join workflow_runs r on r.id = n.workflow_run_id
            where n.status = 'ready' and n.claim_token is null
+             and (n.next_eligible_at is null or n.next_eligible_at <= ?)
              and r.status in ('queued', 'running') and r.cancellation_requested_at is null
-           order by r.created_at, n.created_at, n.node_key limit 1`,
+             and (
+               select count(*) from workflow_nodes active
+               where active.workflow_run_id = r.id and active.status = 'running'
+             ) < r.max_concurrency
+           order by case when r.last_dispatched_at is null then 0 else 1 end,
+                    r.last_dispatched_at, r.created_at, n.created_at, n.node_key limit 1`,
         )
-        .get() as WorkflowNodeRow | undefined;
+        .get(now) as WorkflowNodeRow | undefined;
       if (!candidate) return undefined;
       const updated = this.database.sqlite
         .prepare(
           `update workflow_nodes
            set status = 'running', claim_token = ?, claimed_at = ?, claim_expires_at = ?,
-               attempt = attempt + 1, supervisor_owner_token = ?, supervisor_owner_epoch = ?,
+               next_eligible_at = null, attempt = attempt + 1,
+               supervisor_owner_token = ?, supervisor_owner_epoch = ?,
                heartbeat_at = ?, updated_at = ?
            where id = ? and status = 'ready' and claim_token is null`,
         )
@@ -713,6 +744,9 @@ export class WorkflowStore {
           now,
           now,
         );
+      this.database.sqlite
+        .prepare("update workflow_runs set last_dispatched_at = ?, updated_at = ? where id = ?")
+        .run(now, now, node.workflow_run_id);
       const workflow = this.getWorkflowRow(node.workflow_run_id)!;
       if (workflow.status === "queued") {
         this.database.sqlite
@@ -890,10 +924,44 @@ export class WorkflowStore {
       const status = workflow.status === "cancelling" ? "cancelled" : input.status;
       const resultJson = serializeOptionalJson(input.result);
       const errorJson = serializeOptionalObject(input.error);
+      const retryAt = status === "failed"
+        ? retryEligibleAt(parseJson<WorkflowNodeDefinitionV1>(node.definition_json), input.attempt, input.error, now)
+        : undefined;
+      if (retryAt) {
+        const nodeUpdate = this.database.sqlite
+          .prepare(
+            `update workflow_nodes
+             set status = 'ready', result_json = null, error_json = ?, claim_token = null,
+                 claimed_at = null, claim_expires_at = null, next_eligible_at = ?,
+                 supervisor_owner_token = null, supervisor_owner_epoch = null,
+                 heartbeat_at = ?, updated_at = ?, completed_at = null
+             where id = ? and status = 'running' and attempt = ? and claim_token = ?`,
+          )
+          .run(errorJson, retryAt, now, now, node.id, input.attempt, input.claimToken);
+        if (nodeUpdate.changes !== 1) return false;
+        this.database.sqlite
+          .prepare(
+            `update workflow_node_attempts
+             set phase = 'terminal', terminal_status = 'failed', error_json = ?,
+                 heartbeat_at = ?, updated_at = ?, completed_at = ?
+             where node_id = ? and attempt = ? and claim_token = ? and phase != 'terminal'`,
+          )
+          .run(errorJson, now, now, now, node.id, input.attempt, input.claimToken);
+        this.insertEvent(
+          input.workflowId,
+          "node.retry_scheduled",
+          node.id,
+          { nodeKey: node.node_key, attempt: input.attempt, nextEligibleAt: retryAt },
+          now,
+        );
+        return true;
+      }
       const nodeUpdate = this.database.sqlite
         .prepare(
           `update workflow_nodes
-           set status = ?, result_json = ?, error_json = ?, claim_expires_at = null,
+           set status = ?, result_json = ?, error_json = ?, claim_token = null,
+               claimed_at = null, claim_expires_at = null, next_eligible_at = null,
+               supervisor_owner_token = null, supervisor_owner_epoch = null,
                heartbeat_at = ?, updated_at = ?, completed_at = ?
            where id = ? and status = 'running' and attempt = ? and claim_token = ?`,
         )
@@ -1064,8 +1132,74 @@ export class WorkflowStore {
     return row?.status === "cancelling";
   }
 
+  hasPendingWork(): boolean {
+    return Boolean(
+      this.database.sqlite
+        .prepare("select 1 from workflow_runs where status in ('queued', 'running', 'cancelling') limit 1")
+        .get(),
+    );
+  }
+
+  recordWorktree(input: Omit<WorkflowWorktreeRecord, "state" | "createdAt" | "updatedAt">): WorkflowWorktreeRecord {
+    const now = new Date().toISOString();
+    this.database.sqlite
+      .prepare(
+        `insert into workflow_worktrees (
+           workflow_run_id, node_key, attempt, path, source_root, base_sha, state,
+           retain_until, created_at, updated_at
+         ) values (?, ?, ?, ?, ?, ?, 'allocated', ?, ?, ?)
+         on conflict(workflow_run_id, node_key, attempt) do nothing`,
+      )
+      .run(
+        input.workflowId,
+        input.nodeKey,
+        input.attempt,
+        input.path,
+        input.sourceRoot,
+        input.baseSha,
+        input.retainUntil ?? null,
+        now,
+        now,
+      );
+    return this.requireWorktree(input.workflowId, input.nodeKey, input.attempt);
+  }
+
+  getWorktree(workflowId: string, nodeKey: string, attempt: number): WorkflowWorktreeRecord | undefined {
+    const row = this.database.sqlite
+      .prepare(
+        `select * from workflow_worktrees
+         where workflow_run_id = ? and node_key = ? and attempt = ?`,
+      )
+      .get(workflowId, nodeKey, attempt) as WorkflowWorktreeRow | undefined;
+    return row ? rowToWorktree(row) : undefined;
+  }
+
+  updateWorktreeState(
+    workflowId: string,
+    nodeKey: string,
+    attempt: number,
+    state: WorkflowWorktreeRecord["state"],
+    cleanupError?: string,
+  ): WorkflowWorktreeRecord {
+    const now = new Date().toISOString();
+    const changed = this.database.sqlite
+      .prepare(
+        `update workflow_worktrees set state = ?, cleanup_error = ?, updated_at = ?
+         where workflow_run_id = ? and node_key = ? and attempt = ?`,
+      )
+      .run(state, cleanupError ?? null, now, workflowId, nodeKey, attempt);
+    if (changed.changes !== 1) throw new WorkflowValidationError("Unknown workflow worktree allocation");
+    return this.requireWorktree(workflowId, nodeKey, attempt);
+  }
+
   close(): void {
     this.database.close();
+  }
+
+  private requireWorktree(workflowId: string, nodeKey: string, attempt: number): WorkflowWorktreeRecord {
+    const record = this.getWorktree(workflowId, nodeKey, attempt);
+    if (!record) throw new WorkflowValidationError("Unknown workflow worktree allocation");
+    return record;
   }
 
   private assertActiveSupervisor(identity: WorkflowSupervisorIdentity, now: string): void {
@@ -1145,6 +1279,8 @@ export class WorkflowStore {
       requestHash: row.request_hash,
       workspaceId: row.workspace_id ?? undefined,
       workspaceRoot: row.workspace_root ?? undefined,
+      maxConcurrency: row.max_concurrency,
+      lastDispatchedAt: row.last_dispatched_at ?? undefined,
       result: parseOptionalJson(row.result_json),
       error: parseOptionalJson<JsonObject>(row.error_json),
       cancellationRequestedAt: row.cancellation_requested_at ?? undefined,
@@ -1296,6 +1432,7 @@ function normalizeSubmission(request: SubmitWorkflowRequest): {
   policyJson: string;
   idempotencyKey?: string;
   workspace?: WorkflowWorkspaceScope;
+  maxConcurrency: number;
   requestHash: string;
 } {
   const definition = normalizeDefinition(request.definition);
@@ -1314,10 +1451,20 @@ function normalizeSubmission(request: SubmitWorkflowRequest): {
         workspaceRoot: requireNonEmptyString(request.workspace.workspaceRoot, "Workspace root"),
       }
     : undefined;
+  const maxConcurrency = readBoundedInteger(policy.maxConcurrency, 1, MAX_RUN_CONCURRENCY, "Workflow maxConcurrency");
   const requestHash = createHash("sha256")
     .update(canonicalJson({ definition, input, policy, workspace: workspace ?? null }))
     .digest("hex");
-  return { definition, definitionJson, inputJson, policyJson, idempotencyKey, workspace, requestHash };
+  return {
+    definition,
+    definitionJson,
+    inputJson,
+    policyJson,
+    idempotencyKey,
+    workspace,
+    maxConcurrency,
+    requestHash,
+  };
 }
 
 function normalizeDefinition(definition: WorkflowDefinition): WorkflowDefinition {
@@ -1329,8 +1476,14 @@ function normalizeDefinition(definition: WorkflowDefinition): WorkflowDefinition
   if (!Array.isArray(definition.nodes) || definition.nodes.length === 0) {
     throw new WorkflowValidationError("Workflow definition must contain at least one node");
   }
+  if (definition.nodes.length > MAX_WORKFLOW_NODES) {
+    throw new WorkflowValidationError(`Workflow definition exceeds ${MAX_WORKFLOW_NODES} nodes`);
+  }
   if (definition.edges !== undefined && !Array.isArray(definition.edges)) {
     throw new WorkflowValidationError("Workflow definition edges must be an array");
+  }
+  if ((definition.edges?.length ?? 0) > MAX_WORKFLOW_EDGES) {
+    throw new WorkflowValidationError(`Workflow definition exceeds ${MAX_WORKFLOW_EDGES} edges`);
   }
 
   const keys = new Set<string>();
@@ -1340,6 +1493,9 @@ function normalizeDefinition(definition: WorkflowDefinition): WorkflowDefinition
     }
     const key = node.key.trim();
     if (!key) throw new WorkflowValidationError(`Workflow node at index ${index} has an empty key`);
+    if (!SAFE_NODE_KEY.test(key)) {
+      throw new WorkflowValidationError(`Workflow node key is unsafe: ${key}`);
+    }
     if (keys.has(key)) throw new WorkflowValidationError(`Duplicate workflow node key: ${key}`);
     keys.add(key);
     return { key, type: "agent", config: normalizeObject(node.config ?? {}, `Node ${key} config`) };
@@ -1469,11 +1625,28 @@ function rowToWorkflowNode(row: WorkflowNodeRow): WorkflowNodeRecord {
     claimToken: row.claim_token ?? undefined,
     claimedAt: row.claimed_at ?? undefined,
     claimExpiresAt: row.claim_expires_at ?? undefined,
+    nextEligibleAt: row.next_eligible_at ?? undefined,
     result: parseOptionalJson(row.result_json),
     error: parseOptionalJson<JsonObject>(row.error_json),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     completedAt: row.completed_at ?? undefined,
+  };
+}
+
+function rowToWorktree(row: WorkflowWorktreeRow): WorkflowWorktreeRecord {
+  return {
+    workflowId: row.workflow_run_id,
+    nodeKey: row.node_key,
+    attempt: row.attempt,
+    path: row.path,
+    sourceRoot: row.source_root,
+    baseSha: row.base_sha,
+    state: row.state,
+    retainUntil: row.retain_until ?? undefined,
+    cleanupError: row.cleanup_error ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -1581,6 +1754,44 @@ function validateLease(leaseMs: number, label: string): void {
       `${label} lease must be between 1 and ${MAX_CLAIM_LEASE_MS} milliseconds`,
     );
   }
+}
+
+function retryEligibleAt(
+  definition: WorkflowNodeDefinitionV1,
+  attempt: number,
+  error: JsonObject | undefined,
+  now: string,
+): string | undefined {
+  const config = definition.config ?? {};
+  const effectivePolicy = isObject(config.effectivePolicy) ? config.effectivePolicy : undefined;
+  if (effectivePolicy?.access !== "read_only") return undefined;
+  const retry = isObject(config.retry) ? config.retry : undefined;
+  if (!retry) return undefined;
+  const maxAttempts = readBoundedInteger(retry.maxAttempts, 1, 10, "Retry maxAttempts");
+  if (attempt >= maxAttempts) return undefined;
+  const code = typeof error?.code === "string" ? error.code : undefined;
+  const retryOn = Array.isArray(retry.retryOn)
+    ? retry.retryOn.filter((value): value is string => typeof value === "string")
+    : [];
+  if (!code || !retryOn.includes(code)) return undefined;
+  const backoffMs = retry.backoffMs === undefined
+    ? 0
+    : readBoundedInteger(retry.backoffMs, 0, 60_000, "Retry backoffMs", 0);
+  return new Date(new Date(now).getTime() + backoffMs * attempt).toISOString();
+}
+
+function readBoundedInteger(
+  value: JsonValue | undefined,
+  fallback: number,
+  maximum: number,
+  label: string,
+  minimum = 1,
+): number {
+  if (value === undefined || value === null) return fallback;
+  if (!Number.isSafeInteger(value) || Number(value) < minimum || Number(value) > maximum) {
+    throw new WorkflowValidationError(`${label} must be between ${minimum} and ${maximum}`);
+  }
+  return Number(value);
 }
 
 function requireNonEmptyString(value: string, label: string): string {

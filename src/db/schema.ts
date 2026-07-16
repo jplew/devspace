@@ -118,6 +118,8 @@ export const workflowRuns = sqliteTable(
     requestHash: text("request_hash").notNull(),
     workspaceId: text("workspace_id"),
     workspaceRoot: text("workspace_root"),
+    maxConcurrency: integer("max_concurrency").notNull().default(1),
+    lastDispatchedAt: text("last_dispatched_at"),
     resultJson: text("result_json"),
     errorJson: text("error_json"),
     cancellationRequestedAt: text("cancellation_requested_at"),
@@ -145,6 +147,7 @@ export const workflowNodes = sqliteTable(
     claimToken: text("claim_token"),
     claimedAt: text("claimed_at"),
     claimExpiresAt: text("claim_expires_at"),
+    nextEligibleAt: text("next_eligible_at"),
     supervisorOwnerToken: text("supervisor_owner_token"),
     supervisorOwnerEpoch: integer("supervisor_owner_epoch"),
     heartbeatAt: text("heartbeat_at"),
@@ -269,6 +272,29 @@ export const workflowProviderEvents = sqliteTable(
       columns: [table.nodeId, table.attempt],
       foreignColumns: [workflowNodeAttempts.nodeId, workflowNodeAttempts.attempt],
     }).onDelete("cascade"),
+  ],
+);
+
+export const workflowWorktrees = sqliteTable(
+  "workflow_worktrees",
+  {
+    workflowRunId: text("workflow_run_id")
+      .notNull()
+      .references(() => workflowRuns.id, { onDelete: "cascade" }),
+    nodeKey: text("node_key").notNull(),
+    attempt: integer("attempt").notNull(),
+    path: text("path").notNull().unique(),
+    sourceRoot: text("source_root").notNull(),
+    baseSha: text("base_sha").notNull(),
+    state: text("state").notNull(),
+    retainUntil: text("retain_until"),
+    cleanupError: text("cleanup_error"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.workflowRunId, table.nodeKey, table.attempt] }),
+    index("workflow_worktrees_cleanup_idx").on(table.state, table.retainUntil),
   ],
 );
 

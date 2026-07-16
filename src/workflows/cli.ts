@@ -1,19 +1,11 @@
-import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { Writable } from "node:stream";
 import { devspaceAgentsDir, loadDevspaceFiles, resolveSubagentsFlag } from "../user-config.js";
-import {
-  formatAvailableLocalAgentTargets,
-  resolveLocalAgentTarget,
-} from "../local-agent-targets.js";
-import {
-  loadLocalAgentProfiles,
-  type LocalAgentProfile,
-} from "../local-agent-profiles.js";
+import { loadLocalAgentProfiles } from "../local-agent-profiles.js";
 import { expandHomePath } from "../roots.js";
-import { resolveWorkflowNodePolicy } from "./policy.js";
+import { createWorkflowSubmission } from "./submission.js";
 import { WorkflowOrchestrator } from "./orchestrator.js";
 import {
   WorkflowIdempotencyConflictError,
@@ -23,7 +15,6 @@ import {
 import { ensureSupervisor } from "./supervisor-launch.js";
 import { runWorkflowSupervisor } from "./supervisor.js";
 import type {
-  JsonObject,
   WorkflowRunRecord,
   WorkflowWorkspaceScope,
 } from "./types.js";
@@ -43,6 +34,7 @@ export interface WorkflowsCliContext {
 
 interface WorkflowCliConfig {
   stateDir: string;
+  worktreeRoot: string;
   allowedRoots: string[];
   devspaceAgentsDir: string;
   subagents: boolean;
@@ -158,54 +150,24 @@ async function runCommand(
   }
 
   const profiles = await loadLocalAgentProfiles(config, scope.workspaceRoot);
-  const target = resolveWorkflowTarget(targetName, profiles, model, thinking, context.env);
-  if (!target) {
-    throw new CliInputError(
-      `Unknown workflow profile or provider: ${targetName}. Available ${formatAvailableLocalAgentTargets(profiles)}`,
-    );
-  }
-  const profile = target.kind === "profile" ? target.profile : undefined;
-  const profileBody = profile?.body.trim() ?? "";
-  const profileName = profile?.name ?? target.name;
-  const profileHash = createHash("sha256")
-    .update(JSON.stringify({
-      name: profileName,
-      provider: target.provider,
-      model: target.model ?? null,
-      thinking: target.thinking ?? null,
-      body: profileBody,
-    }))
-    .digest("hex");
-  const workflowPolicy = { version: 1 as const, access };
-  const effectivePolicy = resolveWorkflowNodePolicy({
-    workflowPolicy,
-    nodeConfig: { access },
+  const request = await createWorkflowSubmission({
+    intent: {
+      single: {
+        target: targetName,
+        prompt,
+        model,
+        thinking,
+        access,
+        timeoutMs,
+      },
+      idempotencyKey,
+    },
+    workspace: scope,
+    profiles,
+    worktreeRoot: config.worktreeRoot,
     environment: context.env,
   });
-  const snapshot: JsonObject = {
-    profileBody,
-    profileName,
-    profileHash,
-    provider: target.provider,
-    model: target.model ?? null,
-    thinking: target.thinking ?? null,
-    effectivePolicy: effectivePolicy as unknown as JsonObject,
-    workspaceRoot: scope.workspaceRoot,
-    prompt,
-    timeoutMs: timeoutMs ?? null,
-    environmentPolicy: effectivePolicy.environment as JsonObject,
-  };
-  const submitted = orchestrator.submitDetailed({
-    definition: {
-      version: 1,
-      nodes: [{ key: "agent", type: "agent", config: snapshot }],
-      edges: [],
-    },
-    input: { prompt },
-    policy: workflowPolicy,
-    idempotencyKey,
-    workspace: scope,
-  });
+  const submitted = orchestrator.submitDetailed(request);
   const supervisor = await ensureSupervisor({
     stateDir: config.stateDir,
     cliEntrypoint: context.cliEntrypoint,
@@ -251,30 +213,13 @@ function loadWorkflowCliConfig(env: NodeJS.ProcessEnv, cwd: string): WorkflowCli
     : files.config.allowedRoots ?? [cwd];
   return {
     stateDir,
+    worktreeRoot: resolve(expandHomePath(
+      env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? join(homedir(), ".devspace", "worktrees"),
+    )),
     allowedRoots: rawRoots.map((root) => resolve(expandHomePath(root.trim()))).filter(Boolean),
     devspaceAgentsDir: devspaceAgentsDir(env),
     subagents: resolveSubagentsFlag(files.config, env) === true,
   };
-}
-
-function resolveWorkflowTarget(
-  name: string,
-  profiles: LocalAgentProfile[],
-  model: string | undefined,
-  thinking: string | undefined,
-  env: NodeJS.ProcessEnv,
-): ReturnType<typeof resolveLocalAgentTarget> | {
-  kind: "provider";
-  name: "fake";
-  provider: "fake";
-  model?: string;
-  thinking?: string;
-  profile?: undefined;
-} | undefined {
-  if (name === "fake" && env.DEVSPACE_WORKFLOW_FAKE_PROVIDER === "1") {
-    return { kind: "provider", name: "fake", provider: "fake", model, thinking };
-  }
-  return resolveLocalAgentTarget(name, profiles, model, thinking);
 }
 
 function validateWorkflowArguments(

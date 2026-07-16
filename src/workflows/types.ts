@@ -45,6 +45,14 @@ export interface WorkflowDefinitionV1 {
 
 export type WorkflowDefinition = WorkflowDefinitionV1;
 
+export type WorkflowRetryClass = "provider_failed" | "timed_out";
+
+export interface WorkflowRetryPolicy extends JsonObject {
+  maxAttempts: number;
+  retryOn: WorkflowRetryClass[];
+  backoffMs: number;
+}
+
 export interface WorkflowPolicyV1 extends JsonObject {
   version: typeof WORKFLOW_POLICY_VERSION;
 }
@@ -70,6 +78,7 @@ export interface WorkflowNodeRecord {
   claimToken?: string;
   claimedAt?: string;
   claimExpiresAt?: string;
+  nextEligibleAt?: string;
   result?: JsonValue;
   error?: JsonObject;
   createdAt: string;
@@ -96,6 +105,8 @@ export interface WorkflowRunRecord {
   requestHash: string;
   workspaceId?: string;
   workspaceRoot?: string;
+  maxConcurrency: number;
+  lastDispatchedAt?: string;
   result?: JsonValue;
   error?: JsonObject;
   cancellationRequestedAt?: string;
@@ -183,6 +194,20 @@ export interface WorkflowNodeClaimResult {
 export interface WorkflowEventReadOptions {
   after?: number;
   limit?: number;
+}
+
+export interface WorkflowWorktreeRecord {
+  workflowId: string;
+  nodeKey: string;
+  attempt: number;
+  path: string;
+  sourceRoot: string;
+  baseSha: string;
+  state: "allocated" | "active" | "preserved" | "removed" | "cleanup_failed";
+  createdAt: string;
+  updatedAt: string;
+  retainUntil?: string;
+  cleanupError?: string;
 }
 
 export interface WorkflowNodeClaim {

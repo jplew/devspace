@@ -9,6 +9,11 @@ import {
 } from "../local-agent-runtime.js";
 import { isLocalAgentProvider } from "../local-agent-profiles.js";
 import type { EffectiveLocalAgentPolicy } from "./policy.js";
+import {
+  allocateWorkflowWorktree,
+  cleanupWorkflowWorktree,
+  preserveWorkflowWorktree,
+} from "./worktrees.js";
 import { WorkflowStore, WorkflowValidationError } from "./store.js";
 import type {
   JsonObject,
@@ -22,6 +27,8 @@ const DEFAULT_SUPERVISOR_LEASE_MS = 5_000;
 const DEFAULT_NODE_LEASE_MS = 5_000;
 const DEFAULT_HEARTBEAT_MS = 1_000;
 const DEFAULT_IDLE_MS = 1_000;
+const DEFAULT_GLOBAL_CONCURRENCY = 4;
+const MAX_GLOBAL_CONCURRENCY = 32;
 const MAX_ERROR_CHARS = 16_384;
 const MAX_TIMEOUT_MS = 24 * 60 * 60_000;
 
@@ -37,6 +44,7 @@ export interface WorkflowSupervisorOptions {
   idleMs?: number;
   ownerToken?: string;
   ownerPid?: number;
+  globalConcurrency?: number;
   handleFactory?: WorkflowHandleFactory;
 }
 
@@ -49,7 +57,8 @@ export async function runWorkflowSupervisor(
   const nodeLeaseMs = options.nodeLeaseMs ?? DEFAULT_NODE_LEASE_MS;
   const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const idleMs = options.idleMs ?? DEFAULT_IDLE_MS;
-  validateSupervisorTiming(supervisorLeaseMs, nodeLeaseMs, heartbeatMs, idleMs);
+  const globalConcurrency = options.globalConcurrency ?? DEFAULT_GLOBAL_CONCURRENCY;
+  validateSupervisorTiming(supervisorLeaseMs, nodeLeaseMs, heartbeatMs, idleMs, globalConcurrency);
   const acquired = store.acquireSupervisor({
     ownerToken: options.ownerToken ?? randomUUID(),
     ownerPid: options.ownerPid ?? process.pid,
@@ -61,6 +70,7 @@ export async function runWorkflowSupervisor(
   }
 
   const identity: WorkflowSupervisorIdentity = acquired;
+  const active = new Set<Promise<void>>();
   let lastWorkAt = Date.now();
   try {
     store.reconcileExpiredClaims();
@@ -68,26 +78,42 @@ export async function runWorkflowSupervisor(
     while (store.heartbeatSupervisor(identity, supervisorLeaseMs)) {
       store.reconcileExpiredClaims();
       store.convergeCancellations();
-      const claim = store.claimNextAgentNode({
-        supervisor: identity,
-        claimToken: randomUUID(),
-        leaseMs: nodeLeaseMs,
-      });
-      if (claim) {
+      let claimed = false;
+      while (active.size < globalConcurrency) {
+        const claim = store.claimNextAgentNode({
+          supervisor: identity,
+          claimToken: randomUUID(),
+          leaseMs: nodeLeaseMs,
+        });
+        if (!claim) break;
+        claimed = true;
         lastWorkAt = Date.now();
-        await executeClaim(store, identity, claim, {
+        let execution!: Promise<void>;
+        execution = executeClaim(store, identity, claim, {
           supervisorLeaseMs,
           nodeLeaseMs,
           heartbeatMs,
           handleFactory: options.handleFactory ?? defaultHandleFactory,
+        }).finally(() => {
+          active.delete(execution);
+          lastWorkAt = Date.now();
         });
-        lastWorkAt = Date.now();
-        continue;
+        active.add(execution);
       }
+      if (claimed) continue;
 
       const supervisor = store.getSupervisor();
       if (!supervisor || supervisor.ownerToken !== identity.ownerToken || supervisor.ownerEpoch !== identity.ownerEpoch) {
+        await Promise.allSettled(active);
         return false;
+      }
+      if (active.size > 0) {
+        await Promise.race([...active, delay(heartbeatMs)]);
+        continue;
+      }
+      if (store.hasPendingWork()) {
+        await delay(heartbeatMs);
+        continue;
       }
       if (Date.now() - lastWorkAt >= idleMs) {
         if (store.releaseSupervisor(identity, supervisor.wakeGeneration)) return true;
@@ -96,6 +122,7 @@ export async function runWorkflowSupervisor(
       }
       await delay(Math.min(heartbeatMs, Math.max(10, idleMs - (Date.now() - lastWorkAt))));
     }
+    await Promise.allSettled(active);
     return false;
   } finally {
     store.releaseSupervisor(identity);
@@ -126,6 +153,9 @@ async function executeClaim(
   let timeout: NodeJS.Timeout | undefined;
   let cancellationObserved = false;
   let timeoutObserved = false;
+  let worktreeAllocated = false;
+  let allocatedWorktreeRoot: string | undefined;
+  let completedSuccessfully = false;
   let leaseFailure: Error | undefined;
   let tickRunning = false;
 
@@ -134,6 +164,18 @@ async function executeClaim(
     const fullPrompt = execution.profileBody
       ? `${execution.profileBody}\n\nTask:\n${execution.prompt}`
       : execution.prompt;
+    if (execution.effectivePolicy.access === "workspace_write") {
+      const allocation = await allocateWorkflowWorktree({
+        store,
+        identity,
+        sourceRoot: execution.workspaceRoot,
+        worktreeRoot: execution.worktreeRoot,
+        baseSha: execution.baseSha,
+      });
+      execution.workspaceRoot = allocation.path;
+      allocatedWorktreeRoot = execution.worktreeRoot;
+      worktreeAllocated = true;
+    }
     if (!store.markNodeDispatching(identity)) {
       throw new Error("Workflow node attempt was lost before dispatch.");
     }
@@ -201,7 +243,7 @@ async function executeClaim(
       store.recordNodeProviderSession(identity, result.providerSessionId);
     }
     const cancelled = cancellationObserved || store.isCancellationRequested(identity.workflowId);
-    store.completeAgentNode({
+    const completed = store.completeAgentNode({
       ...identity,
       status: cancelled ? "cancelled" : "succeeded",
       result: {
@@ -210,6 +252,7 @@ async function executeClaim(
         finalResponse: result.finalResponse,
       },
     });
+    completedSuccessfully = Boolean(completed && !cancelled);
   } catch (error) {
     const cancelled = !timeoutObserved && (
       cancellationObserved || store.isCancellationRequested(identity.workflowId) || isAbortError(error)
@@ -223,6 +266,17 @@ async function executeClaim(
     if (heartbeat) clearInterval(heartbeat);
     if (timeout) clearTimeout(timeout);
     await handle?.dispose().catch(() => undefined);
+    if (worktreeAllocated) {
+      if (completedSuccessfully && allocatedWorktreeRoot) {
+        await cleanupWorkflowWorktree({
+          store,
+          identity,
+          worktreeRoot: allocatedWorktreeRoot,
+        }).catch(() => undefined);
+      } else {
+        preserveWorkflowWorktree(store, identity);
+      }
+    }
     store.convergeCancellations();
   }
 }
@@ -261,6 +315,8 @@ function readExecutionSnapshot(config: JsonObject): {
   profileBody: string;
   prompt: string;
   workspaceRoot: string;
+  worktreeRoot: string;
+  baseSha: string;
   timeoutMs?: number;
   effectivePolicy: EffectiveLocalAgentPolicy;
 } {
@@ -283,6 +339,8 @@ function readExecutionSnapshot(config: JsonObject): {
     profileBody: optionalString(config.profileBody) ?? "",
     prompt: requiredString(config.prompt, "prompt"),
     workspaceRoot: requiredString(config.workspaceRoot, "workspaceRoot"),
+    worktreeRoot: optionalString(config.worktreeRoot) ?? "",
+    baseSha: optionalString(config.baseSha) ?? "",
     timeoutMs,
     effectivePolicy: policy as unknown as EffectiveLocalAgentPolicy,
   };
@@ -364,6 +422,7 @@ function validateSupervisorTiming(
   nodeLeaseMs: number,
   heartbeatMs: number,
   idleMs: number,
+  globalConcurrency: number,
 ): void {
   for (const [label, value] of [
     ["supervisor lease", supervisorLeaseMs],
@@ -376,6 +435,11 @@ function validateSupervisorTiming(
   }
   if (!Number.isSafeInteger(idleMs) || idleMs < 0) {
     throw new WorkflowValidationError("Workflow supervisor idle timeout must be a non-negative integer.");
+  }
+  if (!Number.isSafeInteger(globalConcurrency) || globalConcurrency < 1 || globalConcurrency > MAX_GLOBAL_CONCURRENCY) {
+    throw new WorkflowValidationError(
+      `Workflow global concurrency must be between 1 and ${MAX_GLOBAL_CONCURRENCY}.`,
+    );
   }
   if (heartbeatMs >= Math.min(supervisorLeaseMs, nodeLeaseMs)) {
     throw new WorkflowValidationError("Workflow heartbeat interval must be shorter than both leases.");

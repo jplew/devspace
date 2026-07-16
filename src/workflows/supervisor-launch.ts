@@ -63,13 +63,17 @@ export async function ensureSupervisor(input: {
         windowsHide: true,
       },
     );
+    let childExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    child.once("exit", (code, signal) => {
+      childExit = { code, signal };
+    });
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", resolve);
       child.once("error", reject);
     });
     child.unref();
 
-    const deadline = Date.now() + (input.startupTimeoutMs ?? 2_000);
+    const deadline = Date.now() + (input.startupTimeoutMs ?? 5_000);
     while (Date.now() < deadline) {
       const supervisor = store.getSupervisor();
       if (supervisor?.leaseExpiresAt && supervisor.leaseExpiresAt > new Date().toISOString()) {
@@ -79,12 +83,22 @@ export async function ensureSupervisor(input: {
           ownerEpoch: supervisor.ownerEpoch,
         };
       }
+      if (childExit) {
+        throw new Error(
+          `Workflow supervisor exited before acquiring its durable lease (${formatChildExit(childExit)}).`,
+        );
+      }
       await delay(20);
     }
-    throw new Error("Workflow supervisor did not acquire its durable lease.");
+    throw new Error("Workflow supervisor did not acquire its durable lease before the startup timeout.");
   } finally {
     store.close();
   }
+}
+
+function formatChildExit(exit: { code: number | null; signal: NodeJS.Signals | null }): string {
+  if (exit.signal) return `signal ${exit.signal}`;
+  return `exit code ${exit.code ?? "unknown"}`;
 }
 
 function isProcessRunning(pid: number): boolean {

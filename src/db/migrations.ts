@@ -32,6 +32,11 @@ const migrations: Migration[] = [
     name: "workflow-supervisor",
     up: migrateWorkflowSupervisor,
   },
+  {
+    version: 6,
+    name: "workflow-dag-scheduler",
+    up: migrateWorkflowDagScheduler,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -339,6 +344,39 @@ function migrateWorkflowSupervisor(sqlite: Database.Database): void {
 
     create index if not exists workflow_runs_workspace_idx
       on workflow_runs(workspace_id, workspace_root, created_at);
+  `);
+}
+
+function migrateWorkflowDagScheduler(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "workflow_runs", "max_concurrency", "integer not null default 1");
+  addColumnIfMissing(sqlite, "workflow_runs", "last_dispatched_at", "text");
+  addColumnIfMissing(sqlite, "workflow_nodes", "next_eligible_at", "text");
+
+  sqlite.exec(`
+    create table if not exists workflow_worktrees (
+      workflow_run_id text not null,
+      node_key text not null,
+      attempt integer not null,
+      path text not null unique,
+      source_root text not null,
+      base_sha text not null,
+      state text not null check (state in ('allocated', 'active', 'preserved', 'removed', 'cleanup_failed')),
+      retain_until text,
+      cleanup_error text,
+      created_at text not null,
+      updated_at text not null,
+      primary key (workflow_run_id, node_key, attempt),
+      foreign key (workflow_run_id) references workflow_runs(id) on delete cascade
+    );
+
+    create index if not exists workflow_runs_dispatch_idx
+      on workflow_runs(status, last_dispatched_at, created_at);
+
+    create index if not exists workflow_nodes_retry_idx
+      on workflow_nodes(workflow_run_id, status, next_eligible_at);
+
+    create index if not exists workflow_worktrees_cleanup_idx
+      on workflow_worktrees(state, retain_until);
   `);
 }
 
