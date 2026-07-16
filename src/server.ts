@@ -47,6 +47,8 @@ import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import { summarizeLocalAgentProfile } from "./local-agent-profiles.js";
+import { WorkflowOrchestrator } from "./workflows/orchestrator.js";
+import { registerWorkflowTools } from "./workflows/mcp.js";
 import {
   formatLocalAgentProviderAvailabilitySummary,
   getLocalAgentProviderAvailabilitySnapshot,
@@ -688,6 +690,7 @@ function createMcpServer(
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
   localAgentProviders: LocalAgentProviderAvailability[],
+  workflowOrchestrator: WorkflowOrchestrator,
 ): McpServer {
   const server = new McpServer(
     {
@@ -1594,6 +1597,15 @@ function createMcpServer(
     registerCodexProcessTools(server, config, workspaces, processSessions);
   }
 
+  if (config.subagents) {
+    registerWorkflowTools({
+      server,
+      config,
+      workspaces,
+      orchestrator: workflowOrchestrator,
+    });
+  }
+
   return server;
 }
 
@@ -1618,6 +1630,7 @@ export function createServer(config = loadConfig()): RunningServer {
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  const workflowOrchestrator = new WorkflowOrchestrator(config.stateDir);
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
     : [];
@@ -1781,6 +1794,7 @@ export function createServer(config = loadConfig()): RunningServer {
           reviewCheckpoints,
           processSessions,
           localAgentProviders,
+          workflowOrchestrator,
         );
         await server.connect(transport);
       } else {
@@ -1811,6 +1825,7 @@ export function createServer(config = loadConfig()): RunningServer {
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();
+        workflowOrchestrator.close();
         oauthProvider.close();
         workspaceStore.close?.();
       })();
