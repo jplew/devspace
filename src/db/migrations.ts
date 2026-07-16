@@ -22,6 +22,11 @@ const migrations: Migration[] = [
     name: "local-agent-sessions",
     up: migrateLocalAgentSessions,
   },
+  {
+    version: 4,
+    name: "durable-workflows",
+    up: migrateDurableWorkflows,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -172,6 +177,91 @@ function migrateLocalAgentSessions(sqlite: Database.Database): void {
   `);
 
   addColumnIfMissing(sqlite, "local_agent_sessions", "thinking", "text");
+}
+
+function migrateDurableWorkflows(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists workflow_runs (
+      id text primary key,
+      definition_version integer not null,
+      status text not null,
+      definition_json text not null,
+      input_json text not null,
+      policy_json text not null,
+      idempotency_key text unique,
+      request_hash text not null,
+      result_json text,
+      error_json text,
+      cancellation_requested_at text,
+      event_sequence integer not null default 0,
+      created_at text not null,
+      updated_at text not null,
+      started_at text,
+      completed_at text
+    );
+
+    create index if not exists workflow_runs_status_idx
+      on workflow_runs(status, created_at);
+
+    create table if not exists workflow_nodes (
+      id text primary key,
+      workflow_run_id text not null,
+      node_key text not null,
+      node_type text not null,
+      status text not null,
+      definition_json text not null,
+      attempt integer not null default 0,
+      claim_token text,
+      claimed_at text,
+      claim_expires_at text,
+      result_json text,
+      error_json text,
+      created_at text not null,
+      updated_at text not null,
+      completed_at text,
+      foreign key (workflow_run_id) references workflow_runs(id) on delete cascade
+    );
+
+    create unique index if not exists workflow_nodes_run_key_idx
+      on workflow_nodes(workflow_run_id, node_key);
+
+    create unique index if not exists workflow_nodes_run_id_idx
+      on workflow_nodes(workflow_run_id, id);
+
+    create index if not exists workflow_nodes_status_idx
+      on workflow_nodes(workflow_run_id, status, created_at);
+
+    create table if not exists workflow_edges (
+      workflow_run_id text not null,
+      from_node_id text not null,
+      to_node_id text not null,
+      primary key (workflow_run_id, from_node_id, to_node_id),
+      foreign key (workflow_run_id) references workflow_runs(id) on delete cascade,
+      foreign key (workflow_run_id, from_node_id)
+        references workflow_nodes(workflow_run_id, id) on delete cascade,
+      foreign key (workflow_run_id, to_node_id)
+        references workflow_nodes(workflow_run_id, id) on delete cascade
+    );
+
+    create index if not exists workflow_edges_to_node_idx
+      on workflow_edges(workflow_run_id, to_node_id);
+
+    create table if not exists workflow_events (
+      workflow_run_id text not null,
+      sequence integer not null,
+      event_type text not null,
+      node_id text,
+      payload_json text not null,
+      created_at text not null,
+      primary key (workflow_run_id, sequence),
+      foreign key (workflow_run_id) references workflow_runs(id) on delete cascade,
+      foreign key (workflow_run_id, node_id)
+        references workflow_nodes(workflow_run_id, id)
+    );
+
+    create index if not exists workflow_events_cursor_idx
+      on workflow_events(workflow_run_id, sequence);
+  `);
 }
 
 function addColumnIfMissing(
