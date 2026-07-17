@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { filterWorkflowEnvironment } from "./policy.js";
 import { WorkflowStore } from "./store.js";
@@ -56,6 +57,7 @@ export async function ensureSupervisor(input: {
         input.stateDir,
       ],
       {
+        cwd: dirname(cliEntrypoint),
         detached: true,
         stdio: "ignore",
         env: environment,
