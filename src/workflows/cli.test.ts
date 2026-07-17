@@ -11,7 +11,7 @@ const stateDir = join(root, "state");
 const configDir = join(root, "config");
 const agentsDir = join(configDir, "agents");
 const cliPath = fileURLToPath(new URL("../cli.ts", import.meta.url));
-const loaderPath = fileURLToPath(new URL("../../node_modules/tsx/dist/loader.mjs", import.meta.url));
+const loaderUrl = new URL("../../node_modules/tsx/dist/loader.mjs", import.meta.url).href;
 mkdirSync(project, { recursive: true });
 mkdirSync(stateDir, { recursive: true });
 mkdirSync(agentsDir, { recursive: true });
@@ -122,7 +122,7 @@ try {
 }
 
 function runCli(args: string[], env: NodeJS.ProcessEnv) {
-  return spawnSync(process.execPath, ["--import", loaderPath, cliPath, ...args], {
+  return spawnSync(process.execPath, ["--import", loaderUrl, cliPath, ...args], {
     cwd: project,
     env,
     encoding: "utf8",
