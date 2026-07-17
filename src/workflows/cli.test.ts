@@ -43,6 +43,13 @@ try {
   assert.equal(runEnvelope.version, 1);
   assert.equal(runEnvelope.ok, true);
   const workflowId = runEnvelope.workflow!.id;
+  const timed = runCli([
+    "workflows", "wait", workflowId, "--timeout-ms", "0", "--json",
+  ], baseEnv);
+  assert.equal(timed.status, 0, timed.stderr);
+  const timedEnvelope = JSON.parse(timed.stdout) as Envelope;
+  assert.equal(timedEnvelope.timedOut, true, JSON.stringify(timedEnvelope));
+
   const replay = runCli([
     "workflows", "run", "reviewer", "--prompt", "private task", "--json",
     "--idempotency-key", "shell-parent",
@@ -51,13 +58,6 @@ try {
   assert.equal((JSON.parse(replay.stdout) as Envelope).created, false);
 
   writeProfile(profilePath, "Mutated after durable submission.");
-  const timed = runCli([
-    "workflows", "wait", workflowId, "--timeout-ms", "0", "--json",
-  ], baseEnv);
-  assert.equal(timed.status, 0, timed.stderr);
-  const timedEnvelope = JSON.parse(timed.stdout) as Envelope;
-  assert.equal(timedEnvelope.timedOut, true, JSON.stringify(timedEnvelope));
-
   const waited = runCli([
     "workflows", "wait", workflowId, "--timeout-ms", "10000", "--after", "0", "--json",
   ], baseEnv);
