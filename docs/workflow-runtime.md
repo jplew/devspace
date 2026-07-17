@@ -60,11 +60,11 @@ Every `agent()` promise must be awaited, directly or through `parallel`, `pipeli
 
 ## Isolation and limits
 
-The workflow body runs in a separate Node process with the permission model enabled, an empty environment, no inherited stdio, a 64 MiB old-space limit, and a `vm` context that disables string and WebAssembly code generation. The context does not expose Node APIs, imports, `process`, `require`, ambient environment variables, filesystem, network, database handles, or the orchestrator itself.
+The workflow body runs in a separate Node process with the permission model enabled, an empty environment, no inherited stdio, and a 64 MiB old-space limit. Before evaluating workflow code, the child applies SES `lockdown()` and creates a fresh authority-free `Compartment`. Only a hardened orchestration API and bounded JSON values cross into that compartment; Node APIs, imports, `process`, `require`, ambient environment variables, filesystem, network, database handles, and the orchestrator are not endowed.
 
-Source, arguments, logs, event payloads, results, call counts, concurrency, and wall-clock duration are bounded. Scripts can only cause agent execution through `agent()`.
+The child can read only the installed SES runtime packages. Node permissions provide a second boundary around filesystem, subprocess, worker, addon, and—where supported by the running Node release—network access. Source, arguments, logs, event payloads, results, call counts, concurrency, and wall-clock duration are bounded. Scripts can only cause agent execution through `agent()`.
 
-This is a defense-in-depth boundary for trusted workspace workflow files, not a general-purpose multi-tenant JavaScript hosting service. Keep Node current because the boundary relies on Node's permission model and VM implementation.
+Keep Node and the pinned SES dependency current. For hostile multi-tenant execution requiring protection beyond the JavaScript object-capability boundary, run DevSpace inside an operator-managed OS or container sandbox as an additional layer.
 
 ## Durability and replay
 

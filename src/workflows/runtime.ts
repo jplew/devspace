@@ -1,4 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { readFileSync, realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { LocalAgentProfile } from "../local-agent-profiles.js";
 import { createWorkflowSubmission, type WorkflowAgentIntent } from "./submission.js";
 import { WorkflowOrchestrator } from "./orchestrator.js";
@@ -397,14 +400,21 @@ async function wakeSupervisor(input: ExecuteWorkflowRuntimeInput): Promise<unkno
 }
 
 function spawnRuntimeChild(): ChildProcess {
+  const permissionArgs = runtimeDependencyRoots().map((root) => `--allow-fs-read=${root}`);
+  const sesEntrypoint = pathToFileURL(realpathSync(fileURLToPath(import.meta.resolve("ses")))).href;
+  const childSource = RUNTIME_CHILD_SOURCE.replace(
+    "DEVSPACE_SES_ENTRYPOINT",
+    JSON.stringify(sesEntrypoint),
+  );
   return spawn(
     process.execPath,
     [
       "--permission",
+      ...permissionArgs,
       "--max-old-space-size=64",
       "--input-type=module",
       "--eval",
-      RUNTIME_CHILD_SOURCE,
+      childSource,
     ],
     {
       stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -413,6 +423,32 @@ function spawnRuntimeChild(): ChildProcess {
       windowsHide: true,
     },
   );
+}
+
+function runtimeDependencyRoots(): string[] {
+  return [
+    "ses",
+    "@endo/cache-map",
+    "@endo/env-options",
+    "@endo/immutable-arraybuffer",
+  ].map(findPackageRoot);
+}
+
+function findPackageRoot(specifier: string): string {
+  let current = dirname(fileURLToPath(import.meta.resolve(specifier)));
+  while (true) {
+    try {
+      const manifest = JSON.parse(readFileSync(join(current, "package.json"), "utf8")) as {
+        name?: unknown;
+      };
+      if (manifest.name === specifier) return realpathSync(current);
+    } catch {
+      // Continue through package-internal directories until the package root is found.
+    }
+    const parent = dirname(current);
+    if (parent === current) throw new Error(`Unable to resolve runtime dependency '${specifier}'.`);
+    current = parent;
+  }
 }
 
 function sendChild(child: ChildProcess | undefined, message: JsonObject): void {
@@ -546,7 +582,12 @@ function stringField(value: JsonObject | undefined, key: string): string | undef
 }
 
 const RUNTIME_CHILD_SOURCE = String.raw`
-import vm from "node:vm";
+import DEVSPACE_SES_ENTRYPOINT;
+
+lockdown();
+if (typeof Compartment !== "function" || typeof harden !== "function") {
+  throw new Error("SES lockdown did not initialize the workflow runtime");
+}
 
 let nextRequestId = 0;
 let nextCallIndex = 0;
@@ -558,8 +599,13 @@ process.on("message", (message) => {
     const entry = pending.get(message.requestId);
     if (!entry) return;
     pending.delete(message.requestId);
-    if (message.ok) entry.resolve(message.result);
-    else entry.reject(Object.assign(new Error(message.error?.message || "Agent call failed"), message.error));
+    if (message.ok) {
+      entry.resolve(copyJson(message.result, "Agent result"));
+    } else {
+      entry.reject(new Error(
+        typeof message.error?.message === "string" ? message.error.message : "Agent call failed",
+      ));
+    }
     return;
   }
   if (message.type === "start") void start(message);
@@ -568,14 +614,15 @@ process.on("message", (message) => {
 function rpcAgent(request) {
   const requestId = nextRequestId++;
   const callIndex = nextCallIndex++;
+  const safeRequest = copyJson(request, "Agent request");
   return new Promise((resolve, reject) => {
     pending.set(requestId, { resolve, reject });
-    process.send({ type: "agent", requestId, callIndex, request });
+    process.send({ type: "agent", requestId, callIndex, request: safeRequest });
   });
 }
 
 function emit(eventType, payload) {
-  process.send({ type: "event", eventType, payload });
+  process.send({ type: "event", eventType, payload: copyJson(payload, "Runtime event") });
 }
 
 async function start(message) {
@@ -584,21 +631,15 @@ async function start(message) {
       /^export\s+default\s+/,
       "globalThis.__devspaceWorkflow = ",
     );
-    const sandbox = Object.create(null);
-    const context = vm.createContext(sandbox, {
-      name: "devspace-workflow-runtime",
-      codeGeneration: { strings: false, wasm: false },
-    });
-    const script = new vm.Script('"use strict";\n' + transformed, {
-      filename: "workflow.js",
-    });
-    script.runInContext(context, { timeout: 1_000 });
-    const workflow = context.__devspaceWorkflow;
+    const compartment = new Compartment();
+    compartment.evaluate('"use strict";\n' + transformed);
+    const workflow = compartment.globalThis.__devspaceWorkflow;
+    delete compartment.globalThis.__devspaceWorkflow;
     if (typeof workflow !== "function") throw new Error("Default export must be a function");
 
-    const api = Object.freeze({
-      args: deepFreeze(message.args),
-      budget: deepFreeze(message.budget),
+    const api = harden({
+      args: copyJson(message.args, "Workflow args"),
+      budget: copyJson(message.budget, "Workflow budget"),
       agent: (request) => rpcAgent(request),
       parallel: async (tasks) => {
         if (!Array.isArray(tasks)) throw new Error("parallel() requires an array of functions");
@@ -633,18 +674,26 @@ async function start(message) {
     if (pending.size > 0) {
       throw new Error("Workflow returned before all agent() calls were awaited");
     }
-    process.send({ type: "result", result: result === undefined ? null : result });
+    process.send({ type: "result", result: copyJson(result === undefined ? null : result, "Workflow result") });
   } catch (error) {
     process.send({
       type: "failure",
-      error: { name: error?.name || "Error", message: error?.message || String(error) },
+      error: {
+        name: typeof error?.name === "string" ? error.name : "Error",
+        message: typeof error?.message === "string" ? error.message : String(error),
+      },
     });
   }
 }
 
-function deepFreeze(value) {
-  if (!value || typeof value !== "object") return value;
-  for (const nested of Object.values(value)) deepFreeze(nested);
-  return Object.freeze(value);
+function copyJson(value, label) {
+  let serialized;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new Error(label + " must be JSON serializable");
+  }
+  if (serialized === undefined) return null;
+  return harden(JSON.parse(serialized));
 }
 `;

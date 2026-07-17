@@ -12,6 +12,7 @@ try {
   await testParallelPipelineRuntime(join(root, "parallel"));
   await testPrefixReplay(join(root, "replay"));
   await testRestrictedGlobalsAndBudget(join(root, "sandbox"));
+  await testDynamicImportRejected(join(root, "dynamic-import"));
   await testUnawaitedAgentFails(join(root, "unawaited"));
   testMetadataValidation();
 } finally {
@@ -152,14 +153,32 @@ export default async function ({ agent }) {
 async function testRestrictedGlobalsAndBudget(stateDir: string): Promise<void> {
   const source = `
 // @devspace-workflow {"version":1,"maxAgentCalls":7,"maxConcurrency":3,"timeoutMs":5000}
-export default function ({ args, budget }) {
+export default function (api) {
+  const probes = [
+    () => api.agent.constructor("return typeof process")(),
+    () => api.agent.constructor.constructor("return typeof process")(),
+    () => api.constructor.constructor("return typeof process")(),
+    () => Object.getPrototypeOf(api.agent).constructor("return typeof process")(),
+    () => (async function () {}).constructor("return typeof process")(),
+    () => (function* () {}).constructor("return typeof process")(),
+    () => (0, eval)("typeof process")
+  ].map((probe) => {
+    try {
+      return probe();
+    } catch {
+      return "blocked";
+    }
+  });
   return {
-    args,
-    budget,
+    args: api.args,
+    budget: api.budget,
+    probes,
     globals: {
       process: typeof process,
       require: typeof require,
-      fetch: typeof fetch
+      fetch: typeof fetch,
+      Buffer: typeof Buffer,
+      WebSocket: typeof WebSocket
     }
   };
 }
@@ -173,11 +192,41 @@ export default function ({ args, budget }) {
     profiles: [],
   });
   assert.equal(result.run.status, "succeeded", JSON.stringify(result.run.error));
-  assert.deepEqual(result.run.result, {
-    args: { value: "safe" },
-    budget: { maxAgentCalls: 7, maxConcurrency: 3, timeoutMs: 5000 },
-    globals: { process: "undefined", require: "undefined", fetch: "undefined" },
+  const output = result.run.result as {
+    args: { value: string };
+    budget: { maxAgentCalls: number; maxConcurrency: number; timeoutMs: number };
+    probes: string[];
+    globals: Record<string, string>;
+  };
+  assert.deepEqual(output.args, { value: "safe" });
+  assert.deepEqual(output.budget, { maxAgentCalls: 7, maxConcurrency: 3, timeoutMs: 5000 });
+  assert.ok(output.probes.every((probe) => probe === "undefined" || probe === "blocked"));
+  assert.deepEqual(output.globals, {
+    process: "undefined",
+    require: "undefined",
+    fetch: "undefined",
+    Buffer: "undefined",
+    WebSocket: "undefined",
   });
+}
+
+async function testDynamicImportRejected(stateDir: string): Promise<void> {
+  const result = await executeWorkflowRuntime({
+    stateDir,
+    worktreeRoot: join(stateDir, "worktrees"),
+    source: `
+// @devspace-workflow {"version":1,"timeoutMs":5000}
+export default async function () {
+  await import("node:net");
+  return "unreachable";
+}
+`,
+    args: {},
+    workspace: { workspaceId: "workspace", workspaceRoot: root },
+    profiles: [],
+  });
+  assert.equal(result.run.status, "failed");
+  assert.match(String(result.run.error?.message), /import expression rejected/i);
 }
 
 async function testUnawaitedAgentFails(stateDir: string): Promise<void> {
