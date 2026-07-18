@@ -107,9 +107,25 @@ regular-file enforcement, and no-follow file opens where the platform supports
 them.
 
 Artifact records are scoped to the authenticated OAuth client. The first
-version remains under the existing owner-only `devspace` scope. It does not add
-an unauthenticated download route or expose the artifact root with
-`express.static`.
+version remains under the existing owner-only `devspace` scope. Protected
+`GET`/`HEAD /artifacts/:artifactId` downloads use the same bearer and OAuth
+resource boundary, require record ownership, force attachment disposition,
+allowlist safe content types, add `nosniff`, and disable caching. Partial uploads
+are not addressable. The artifact root is never exposed with `express.static`,
+and resource URLs contain no bearer or signed query token.
+
+Canonical objects remain digest-addressed and private. Tool results expose only
+per-record materialized presentation paths under
+`artifactRoot/materialized/art_<id>/<sanitized-name>`. These files are verified
+against the canonical object and remain mode `0600`. Only artifact paths
+returned by tools are valid outside-workspace capability paths.
+
+Copying into a workspace is an explicit operation because it can dirty a
+repository. The copy path uses the existing workspace containment guard,
+rejects symlink parents/destinations, requires an explicit conflict mode, writes
+atomically, re-verifies size and SHA-256, and strips executable permissions.
+Workspace export accepts only a contained regular non-symlink file and stages a
+private copy without modifying the workspace.
 
 Native staging is adapter-gated. The opaque `stage_artifact.file` value is
 never treated as a URL or path merely because it contains a string. Exactly one
@@ -140,7 +156,10 @@ disabled unless `DEVSPACE_LOG_SHELL_COMMANDS=1`.
 Do not enable shell command logging if commands may contain secrets.
 
 Artifact tool logs contain identifiers, names, MIME hints, byte counts, hashes,
-and status fields. `stage_artifact` logs only whether a file value and expected
-digest were supplied plus non-sensitive options; it does not log the opaque
-file value. Raw content, connector references, bearer credentials, presigned
-URLs, and base64 chunks are never included in tool logs or tool results.
+workspace paths, conflict modes, and status fields. `stage_artifact` logs only
+whether a file value and expected digest were supplied plus non-sensitive
+options; it does not log the opaque file value. Raw content, connector
+references, base64 chunks, bearer credentials, authorization headers,
+presigned URLs, and protected download URLs are never included in tool logs.
+Tool results may include a tokenless protected resource URL that still requires
+the caller's bearer authorization.

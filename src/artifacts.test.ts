@@ -120,10 +120,10 @@ async function testBinaryRoundTrip(testRoot: string): Promise<void> {
     assert.equal(artifact.workspaceId, "ws_123");
     assert.deepEqual(await readFile(artifact.hostPath), bytes);
 
-    const inspected = store.statArtifact("client-a", artifact.artifactId);
+    const inspected = await store.statArtifact("client-a", artifact.artifactId);
     assert.deepEqual(inspected, artifact);
     await expectArtifactError(
-      Promise.resolve().then(() => store.statArtifact("client-b", artifact.artifactId)),
+      store.statArtifact("client-b", artifact.artifactId),
       "artifact_not_found",
     );
 
@@ -267,11 +267,14 @@ async function testReferenceAwareDeletion(testRoot: string): Promise<void> {
     const bytes = Buffer.from("deduplicated-object");
     const first = await stage(store, "client-a", "first.txt", bytes);
     const second = await stage(store, "client-a", "second.txt", bytes);
-    assert.equal(first.hostPath, second.hostPath);
+    assert.notEqual(first.hostPath, second.hostPath);
+    assert.match(first.hostPath, /materialized\/art_[^/]+\/first\.txt$/u);
+    assert.match(second.hostPath, /materialized\/art_[^/]+\/second\.txt$/u);
     assert.equal(store.health().storedBytes, bytes.length);
 
     const firstDelete = await store.deleteArtifact("client-a", first.artifactId);
     assert.equal(firstDelete.objectDeleted, false);
+    await assert.rejects(lstat(first.hostPath), { code: "ENOENT" });
     assert.deepEqual(await readFile(second.hostPath), bytes);
 
     const secondDelete = await store.deleteArtifact("client-a", second.artifactId);
@@ -313,12 +316,13 @@ async function testExpirationAndPinning(testRoot: string): Promise<void> {
     assert.equal(cleanup.artifactsDeleted, 1);
     assert.equal(cleanup.objectsDeleted, 0);
     await expectArtifactError(
-      Promise.resolve().then(() => store.statArtifact("client-a", expiring.artifactId)),
+      store.statArtifact("client-a", expiring.artifactId),
       "artifact_not_found",
     );
+    await assert.rejects(lstat(expiring.hostPath), { code: "ENOENT" });
     assert.deepEqual(await readFile(live.hostPath), shared);
-    assert.equal(store.statArtifact("client-a", live.artifactId).artifactId, live.artifactId);
-    assert.equal(store.statArtifact("client-a", pinned.artifactId).pinned, true);
+    assert.equal((await store.statArtifact("client-a", live.artifactId)).artifactId, live.artifactId);
+    assert.equal((await store.statArtifact("client-a", pinned.artifactId)).pinned, true);
   } finally {
     store.close();
   }
@@ -398,6 +402,25 @@ async function testContainmentAndSymlinks(testRoot: string): Promise<void> {
       "unsafe_object",
     );
     assert.equal(await readFile(outside, "utf8"), "outside-safe");
+
+    const protectedArtifact = await stage(
+      store,
+      "client-a",
+      "protected.txt",
+      Buffer.from("protected-materialized-content"),
+    );
+    const materializedDirectory = dirname(protectedArtifact.hostPath);
+    const outsideMaterializedDirectory = join(testRoot, "outside-materialized");
+    const outsideMaterializedFile = join(outsideMaterializedDirectory, "protected.txt");
+    await mkdir(outsideMaterializedDirectory, { recursive: true });
+    await writeFile(outsideMaterializedFile, "outside-materialized-safe");
+    await rm(materializedDirectory, { recursive: true, force: true });
+    await symlink(outsideMaterializedDirectory, materializedDirectory, "dir");
+    await expectArtifactError(
+      store.deleteArtifact("client-a", protectedArtifact.artifactId),
+      "unsafe_materialized_artifact",
+    );
+    assert.equal(await readFile(outsideMaterializedFile, "utf8"), "outside-materialized-safe");
 
     const realRoot = join(testRoot, "real-artifact-root");
     const aliasRoot = join(testRoot, "artifact-root-alias");

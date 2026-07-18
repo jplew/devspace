@@ -50,7 +50,7 @@ DEVSPACE_ARTIFACTS=1 npx @waishnav/devspace serve
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DEVSPACE_ARTIFACTS` | `0` | Expose private native staging, fallback upload, stat, and delete tools. |
+| `DEVSPACE_ARTIFACTS` | `0` | Expose private native staging, fallback upload, copy, export, stat, delete, resource-link, and protected-download surfaces. |
 | `DEVSPACE_ARTIFACT_ROOT` | `~/.local/share/devspace/artifacts` | Private storage root outside repositories and worktrees. |
 | `DEVSPACE_ARTIFACT_MAX_FILE_BYTES` | `104857600` | Maximum decoded size of one artifact (100 MiB). |
 | `DEVSPACE_ARTIFACT_MAX_TOTAL_BYTES` | `1073741824` | Maximum combined stored-object and pending-upload bytes (1 GiB). |
@@ -62,12 +62,18 @@ The same settings may be persisted in `~/.devspace/config.json` as
 
 When enabled, DevSpace exposes `stage_artifact`, `artifact_upload_begin`,
 `artifact_upload_chunk`, `artifact_upload_commit`, `artifact_upload_abort`,
-`artifact_stat`, and `artifact_delete`. `stage_artifact` accepts an opaque native
-file value only through an explicitly injected trusted adapter; no
-host-specific adapter is enabled by default before connector validation. The
-fallback protocol accepts sequential canonical-base64 chunks of at most 48 KiB
-after decoding. Incomplete uploads expire after one hour. Cleanup runs at
-startup and periodically, with a bounded number of records processed per pass.
+`artifact_stat`, `artifact_copy_to_workspace`,
+`artifact_export_from_workspace`, and `artifact_delete`. `stage_artifact`
+accepts an opaque native file value only through an explicitly injected trusted
+adapter; no host-specific adapter is enabled by default before connector
+validation. The fallback protocol accepts sequential canonical-base64 chunks of
+at most 48 KiB after decoding. Staged, committed, inspected, and exported
+artifacts include a safe materialized filename path, an MCP resource link, and
+a bearer-protected `/artifacts/:artifactId` download reference. Copying into a
+workspace is explicit and may dirty a repository; exporting a contained regular
+file stages a private copy without modifying the workspace. Incomplete uploads
+expire after one hour. Cleanup runs at startup and periodically, with a bounded
+number of records processed per pass.
 
 Run `devspace doctor` to inspect the configured root, current storage use,
 pending uploads, and expired records awaiting cleanup. See
