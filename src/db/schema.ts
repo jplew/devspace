@@ -73,6 +73,58 @@ export const oauthRefreshTokens = sqliteTable(
   },
 );
 
+export const artifacts = sqliteTable(
+  "artifacts",
+  {
+    id: text("id").primaryKey(),
+    clientId: text("client_id"),
+    workspaceId: text("workspace_id"),
+    originalName: text("original_name").notNull(),
+    mimeType: text("mime_type"),
+    size: integer("size").notNull(),
+    sha256: text("sha256").notNull(),
+    storagePath: text("storage_path").notNull(),
+    source: text("source").notNull(),
+    status: text("status").notNull(),
+    createdAt: text("created_at").notNull(),
+    expiresAt: text("expires_at"),
+    pinned: integer("pinned").notNull().default(0),
+    lastUsedAt: text("last_used_at").notNull(),
+  },
+  (table) => [
+    index("artifacts_sha256_storage_idx").on(table.sha256, table.storagePath),
+    index("artifacts_expiry_idx").on(table.status, table.pinned, table.expiresAt),
+    index("artifacts_workspace_idx").on(table.workspaceId, table.lastUsedAt),
+    index("artifacts_client_idx").on(table.clientId, table.lastUsedAt),
+  ],
+);
+
+export const artifactUploads = sqliteTable(
+  "artifact_uploads",
+  {
+    id: text("id").primaryKey(),
+    clientId: text("client_id"),
+    workspaceId: text("workspace_id"),
+    originalName: text("original_name").notNull(),
+    mimeType: text("mime_type"),
+    expectedSize: integer("expected_size"),
+    expectedSha256: text("expected_sha256"),
+    receivedSize: integer("received_size").notNull().default(0),
+    tempPath: text("temp_path").notNull(),
+    status: text("status").notNull(),
+    artifactTtlHours: integer("artifact_ttl_hours").notNull(),
+    lastChunkOffset: integer("last_chunk_offset"),
+    lastChunkSize: integer("last_chunk_size"),
+    lastChunkSha256: text("last_chunk_sha256"),
+    createdAt: text("created_at").notNull(),
+    expiresAt: text("expires_at").notNull(),
+  },
+  (table) => [
+    index("artifact_uploads_expiry_idx").on(table.status, table.expiresAt),
+    index("artifact_uploads_client_idx").on(table.clientId, table.createdAt),
+  ],
+);
+
 export const localAgentSessions = sqliteTable(
   "local_agent_sessions",
   {
@@ -101,5 +153,9 @@ export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
+export type ArtifactRow = typeof artifacts.$inferSelect;
+export type NewArtifactRow = typeof artifacts.$inferInsert;
+export type ArtifactUploadRow = typeof artifactUploads.$inferSelect;
+export type NewArtifactUploadRow = typeof artifactUploads.$inferInsert;
 export type LocalAgentSessionRow = typeof localAgentSessions.$inferSelect;
 export type NewLocalAgentSessionRow = typeof localAgentSessions.$inferInsert;

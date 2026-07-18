@@ -224,6 +224,10 @@ async function serve(): Promise<void> {
     }
     console.log("auth: Owner password approval required");
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
+    console.log(`artifact exchange: ${config.artifactsEnabled ? "enabled" : "disabled"}`);
+    if (config.artifactsEnabled) {
+      console.log(`artifact root: ${config.artifactRoot}`);
+    }
     if (config.subagents) {
       console.log(`subagent providers: ${formatLocalAgentProviderAvailabilitySummary(localAgentProviders)}`);
     }
@@ -264,6 +268,22 @@ async function runDoctor(): Promise<void> {
     console.log(`Public MCP URL: ${new URL("/mcp", config.publicBaseUrl).toString()}`);
     console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
+    console.log(`Artifact exchange: ${config.artifactsEnabled ? "enabled" : "disabled"}`);
+    if (config.artifactsEnabled) {
+      const { ArtifactStore, formatBytes } = await import("./artifacts.js");
+      const store = new ArtifactStore(config);
+      try {
+        const health = store.health();
+        console.log(`Artifact root: ${health.root}`);
+        console.log(
+          `Artifact storage: ${formatBytes(health.storedBytes)} / ${formatBytes(health.maxTotalBytes)}`,
+        );
+        console.log(`Pending uploads: ${health.pendingUploads}`);
+        console.log(`Expired artifacts awaiting cleanup: ${health.expiredArtifacts}`);
+      } finally {
+        store.close();
+      }
+    }
   } catch (error) {
     console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
   }

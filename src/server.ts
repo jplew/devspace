@@ -18,6 +18,11 @@ import express from "express";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch } from "./apply-patch.js";
+import { registerArtifactTools } from "./artifact-tools.js";
+import {
+  ARTIFACT_CLEANUP_INTERVAL_MS,
+  ArtifactStore,
+} from "./artifacts.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
 import {
   logEvent,
@@ -179,13 +184,16 @@ interface ToolLogFields {
 }
 
 function serverInstructions(config: ServerConfig): string {
+  const artifactInstruction = config.artifactsEnabled
+    ? " Use the artifact_upload_begin, artifact_upload_chunk, artifact_upload_commit, artifact_upload_abort, artifact_stat, and artifact_delete tools for private file transfer that is not already host-visible. Only use host paths returned by artifact tools; never invent artifact-store paths or place artifact content/base64 in shell commands or logs."
+    : "";
   const showChangesInstruction =
     config.widgets === "changes"
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${showChangesInstruction}`;
+    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -198,7 +206,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChangesInstruction}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -688,6 +696,8 @@ function createMcpServer(
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
   localAgentProviders: LocalAgentProviderAvailability[],
+  artifactStore: ArtifactStore | undefined,
+  clientId: string,
 ): McpServer {
   const server = new McpServer(
     {
@@ -1594,6 +1604,14 @@ function createMcpServer(
     registerCodexProcessTools(server, config, workspaces, processSessions);
   }
 
+  if (artifactStore) {
+    registerArtifactTools(server, {
+      config,
+      store: artifactStore,
+      clientId,
+    });
+  }
+
   return server;
 }
 
@@ -1615,6 +1633,7 @@ export function createServer(config = loadConfig()): RunningServer {
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
+  const artifactStore = config.artifactsEnabled ? new ArtifactStore(config) : undefined;
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
@@ -1652,6 +1671,24 @@ export function createServer(config = loadConfig()): RunningServer {
       .then((results) => logSessionCloseResults("idle_timeout", results));
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
   sessionCleanupTimer.unref();
+
+  const runArtifactCleanup = () => {
+    if (!artifactStore) return;
+    void artifactStore.cleanupExpired()
+      .then((result) => {
+        logEvent(config.logging, "debug", "artifact_cleanup", { ...result });
+      })
+      .catch((error) => {
+        logEvent(config.logging, "warn", "artifact_cleanup_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+  };
+  runArtifactCleanup();
+  const artifactCleanupTimer = artifactStore
+    ? setInterval(runArtifactCleanup, ARTIFACT_CLEANUP_INTERVAL_MS)
+    : undefined;
+  artifactCleanupTimer?.unref();
 
   if (config.logging.trustProxy) {
     app.set("trust proxy", true);
@@ -1781,6 +1818,8 @@ export function createServer(config = loadConfig()): RunningServer {
           reviewCheckpoints,
           processSessions,
           localAgentProviders,
+          artifactStore,
+          req.auth.clientId,
         );
         await server.connect(transport);
       } else {
@@ -1808,10 +1847,12 @@ export function createServer(config = loadConfig()): RunningServer {
     close: () => {
       closePromise ??= (async () => {
         clearInterval(sessionCleanupTimer);
+        if (artifactCleanupTimer) clearInterval(artifactCleanupTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();
         oauthProvider.close();
+        artifactStore?.close();
         workspaceStore.close?.();
       })();
       return closePromise;
@@ -1839,6 +1880,10 @@ if (await isMainModule()) {
     console.log(`request logging: ${config.logging.requests ? "enabled" : "disabled"}`);
     console.log(`asset logging: ${config.logging.assets ? "enabled" : "disabled"}`);
     console.log(`trust proxy: ${config.logging.trustProxy ? "enabled" : "disabled"}`);
+    console.log(`artifact exchange: ${config.artifactsEnabled ? "enabled" : "disabled"}`);
+    if (config.artifactsEnabled) {
+      console.log(`artifact root: ${config.artifactRoot}`);
+    }
     if (config.subagents) {
       console.log(`subagent providers: ${formatLocalAgentProviderAvailabilitySummary(localAgentProviders)}`);
     }

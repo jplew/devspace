@@ -91,6 +91,27 @@ try {
     DEVSPACE_SUBAGENTS: "1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
   }).subagents, true);
+
+  const artifactRoot = join(root, "artifacts");
+  const doctorOutput = execFileSync("node", ["--import", "tsx", "src/cli.ts", "doctor"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      DEVSPACE_CONFIG_DIR: configDir,
+      DEVSPACE_ALLOWED_ROOTS: projectRoot,
+      DEVSPACE_STATE_DIR: stateDir,
+      DEVSPACE_ARTIFACTS: "1",
+      DEVSPACE_ARTIFACT_ROOT: artifactRoot,
+      DEVSPACE_ARTIFACT_MAX_TOTAL_BYTES: "4096",
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    },
+  });
+  assert.match(doctorOutput, /Artifact exchange: enabled/);
+  assert.match(doctorOutput, new RegExp(`Artifact root: ${artifactRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(doctorOutput, /Artifact storage: 0 B \/ 4 KiB/);
+  assert.match(doctorOutput, /Pending uploads: 0/);
+  assert.match(doctorOutput, /Expired artifacts awaiting cleanup: 0/);
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

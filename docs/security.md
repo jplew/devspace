@@ -92,9 +92,45 @@ Managed worktrees reduce accidental edits to your active checkout, but they are
 not a security boundary. They are a workflow boundary for isolated coding
 sessions.
 
+## Artifact Exchange
+
+The Artifact Exchange is an opt-in private byte-transfer seam. Its root is
+separate from allowed workspace roots, repositories, worktrees, temporary
+folders, and public static assets.
+
+DevSpace selects every storage path. Artifact names are metadata, not path
+components. Names are Unicode-normalized and must be a single non-hidden
+basename without separators, NUL bytes, or control characters. The store uses
+content-addressed immutable objects, mode `0700` directories, mode `0600`
+object and partial files, atomic promotion, realpath containment checks,
+regular-file enforcement, and no-follow file opens where the platform supports
+them.
+
+Artifact records are scoped to the authenticated OAuth client. The first
+version remains under the existing owner-only `devspace` scope. It does not add
+an unauthenticated download route or expose the artifact root with
+`express.static`.
+
+The exchange deliberately does not:
+
+- fetch arbitrary URLs
+- extract archives
+- execute transferred content
+- expand workspace allowlists
+- preserve executable permissions
+- publish or permanently retain content
+
+MIME types are hints only. SHA-256 and byte counts are computed and enforced by
+the server. Pinned records require explicit deletion; unpinned records and
+incomplete uploads remain subject to cleanup.
+
 ## Logs
 
 By default, DevSpace logs requests and tool calls. Shell command previews are
 disabled unless `DEVSPACE_LOG_SHELL_COMMANDS=1`.
 
 Do not enable shell command logging if commands may contain secrets.
+
+Artifact tool logs contain identifiers, names, MIME hints, byte counts, hashes,
+and status fields. Raw content and base64 chunks are never included in tool
+logs or tool results.
