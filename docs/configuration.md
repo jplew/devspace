@@ -50,7 +50,7 @@ DEVSPACE_ARTIFACTS=1 npx @waishnav/devspace serve
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DEVSPACE_ARTIFACTS` | `0` | Expose the private artifact upload, stat, and delete tools. |
+| `DEVSPACE_ARTIFACTS` | `0` | Expose private native staging, fallback upload, stat, and delete tools. |
 | `DEVSPACE_ARTIFACT_ROOT` | `~/.local/share/devspace/artifacts` | Private storage root outside repositories and worktrees. |
 | `DEVSPACE_ARTIFACT_MAX_FILE_BYTES` | `104857600` | Maximum decoded size of one artifact (100 MiB). |
 | `DEVSPACE_ARTIFACT_MAX_TOTAL_BYTES` | `1073741824` | Maximum combined stored-object and pending-upload bytes (1 GiB). |
@@ -60,12 +60,14 @@ The same settings may be persisted in `~/.devspace/config.json` as
 `artifactsEnabled`, `artifactRoot`, `artifactMaxFileBytes`,
 `artifactMaxTotalBytes`, and `artifactDefaultTtlHours`.
 
-When enabled, DevSpace exposes `artifact_upload_begin`,
+When enabled, DevSpace exposes `stage_artifact`, `artifact_upload_begin`,
 `artifact_upload_chunk`, `artifact_upload_commit`, `artifact_upload_abort`,
-`artifact_stat`, and `artifact_delete`. The fallback protocol accepts sequential
-canonical-base64 chunks of at most 48 KiB after decoding. Incomplete uploads
-expire after one hour. Cleanup runs at startup and periodically, with a bounded
-number of records processed per pass.
+`artifact_stat`, and `artifact_delete`. `stage_artifact` accepts an opaque native
+file value only through an explicitly injected trusted adapter; no
+host-specific adapter is enabled by default before connector validation. The
+fallback protocol accepts sequential canonical-base64 chunks of at most 48 KiB
+after decoding. Incomplete uploads expire after one hour. Cleanup runs at
+startup and periodically, with a bounded number of records processed per pass.
 
 Run `devspace doctor` to inspect the configured root, current storage use,
 pending uploads, and expired records awaiting cleanup. See

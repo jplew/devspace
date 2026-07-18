@@ -20,6 +20,101 @@ The SQLite state database remains authoritative for records and upload
 sessions. Immutable content objects are addressed by their server-computed
 SHA-256 digest.
 
+## Native File Staging
+
+`stage_artifact` is the preferred action when an MCP host supplies an attached
+or generated file as a native top-level tool value:
+
+```json
+{
+  "file": "<opaque host-provided value>",
+  "workspaceId": "optional association only",
+  "expectedSha256": "sha256:...",
+  "ttlHours": 24,
+  "pin": false
+}
+```
+
+The `file` value is deliberately opaque. DevSpace does not assume a ChatGPT,
+Claude, URL, mounted-path, or embedded-byte shape. It selects exactly one
+explicitly registered `IncomingArtifactAdapter`; zero matches fail closed, and
+multiple matches fail as ambiguous. A workspace ID is metadata only and never
+a write destination.
+
+A successful stage streams through the same byte limits, total quota,
+server-side SHA-256, private partial-file, and atomic content-addressed commit
+pipeline as the fallback upload tools. The result contains only the artifact
+ID, sanitized name, MIME hint, byte size, SHA-256, host path, expiry, and a
+short instruction. It never returns file content, base64, bearer credentials,
+or presigned URLs.
+
+Adapters are injected explicitly when constructing the server:
+
+```ts
+createServer(config, {
+  incomingArtifactAdapters: [trustedAdapter],
+});
+```
+
+The boundary is:
+
+```ts
+interface IncomingArtifactAdapter {
+  readonly id: string;
+  canHandle(value: unknown): boolean;
+  open(value: unknown): Promise<{
+    name: string;
+    mimeType?: string;
+    size?: number;
+    stream: NodeJS.ReadableStream;
+  }>;
+}
+```
+
+No host-specific adapter is enabled by default until its real connector value
+has been observed and reviewed.
+
+### Deterministic Fixture and Probe Harness
+
+Unit tests use only the explicit local fixture reference:
+
+```ts
+{
+  kind: "devspace-local-fixture-v1",
+  relativePath: "nested/report.md",
+  name?: "report.md",
+  mimeType?: "text/markdown"
+}
+```
+
+`createLocalFixtureIncomingArtifactAdapter(fixtureRoot)` accepts only that
+branded object, requires a contained regular non-symlink file, and is not
+registered by the production server.
+
+For the later manual connector compatibility exercise,
+`createIncomingArtifactProbeAdapter(normalize)` receives:
+
+```ts
+{
+  rawValue: unknown,                  // process-local callback input only
+  shape: IncomingArtifactProbeShape  // redacted type/key/length summary
+}
+```
+
+The callback may return a normalized stream source when the value is known and
+trusted. Returning `undefined` records the in-process capture and deliberately
+fails staging with `incoming_artifact_probe_captured`; the raw value is never
+put in tool results or logs. The redacted shape preserves ordinary structural
+keys and value classes while omitting string contents; unusual or long keys are
+replaced with placeholders so tokens and presigned URLs are not persisted.
+
+Remaining manual validation is intentionally separate from this code change:
+run the actual ChatGPT DevSpace connector in an approved maintenance window,
+attach a small benign file, inject the probe adapter, inspect the process-local
+capture, document a sanitized fixture, and then implement and review one
+trusted host-specific adapter. Until that happens, DevSpace makes no claim that
+`stage_artifact` accepts ChatGPT native file references.
+
 ## Fallback Upload Protocol
 
 ### 1. Begin
@@ -136,7 +231,9 @@ workspace roots, or automatically publish artifacts.
 
 ## Current Non-Goals
 
-This foundation does not yet include a host-specific native file adapter,
-workspace copy/export tools, authenticated download resources, archive
-handling, malware scanning, or permanent storage. Those capabilities require
-separate design and testing rather than expanding this transfer seam implicitly.
+This foundation does not yet include a validated production host-specific
+native file adapter, workspace copy/export tools, authenticated download
+resources, archive handling, malware scanning, or permanent storage. The
+`stage_artifact` boundary and probe harness do not claim connector
+compatibility by themselves. Those capabilities require separate design and
+testing rather than expanding this transfer seam implicitly.

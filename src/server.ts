@@ -24,6 +24,7 @@ import {
   ArtifactStore,
 } from "./artifacts.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import type { IncomingArtifactAdapter } from "./incoming-artifacts.js";
 import {
   logEvent,
   requestIp,
@@ -185,7 +186,7 @@ interface ToolLogFields {
 
 function serverInstructions(config: ServerConfig): string {
   const artifactInstruction = config.artifactsEnabled
-    ? " Use the artifact_upload_begin, artifact_upload_chunk, artifact_upload_commit, artifact_upload_abort, artifact_stat, and artifact_delete tools for private file transfer that is not already host-visible. Only use host paths returned by artifact tools; never invent artifact-store paths or place artifact content/base64 in shell commands or logs."
+    ? " When the user supplies or generates a file that is not present on the DevSpace host, use stage_artifact instead of recreating it through write/edit calls. Paths returned by artifact tools may be passed to local commands. Use artifact_copy_to_workspace only when the file should become part of the project. If the MCP host cannot supply a native file reference, use the artifact_upload_begin, artifact_upload_chunk, artifact_upload_commit, and artifact_upload_abort fallback. Only use host paths returned by artifact tools; never invent artifact-store paths or place artifact content/base64 in shell commands or logs."
     : "";
   const showChangesInstruction =
     config.widgets === "changes"
@@ -698,6 +699,7 @@ function createMcpServer(
   localAgentProviders: LocalAgentProviderAvailability[],
   artifactStore: ArtifactStore | undefined,
   clientId: string,
+  incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
 ): McpServer {
   const server = new McpServer(
     {
@@ -1609,13 +1611,21 @@ function createMcpServer(
       config,
       store: artifactStore,
       clientId,
+      incomingArtifactAdapters,
     });
   }
 
   return server;
 }
 
-export function createServer(config = loadConfig()): RunningServer {
+export interface CreateServerOptions {
+  incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+}
+
+export function createServer(
+  config = loadConfig(),
+  options: CreateServerOptions = {},
+): RunningServer {
   const allowedHosts = config.allowedHosts.includes("*")
     ? undefined
     : Array.from(new Set([config.host, ...config.allowedHosts]));
@@ -1820,6 +1830,7 @@ export function createServer(config = loadConfig()): RunningServer {
           localAgentProviders,
           artifactStore,
           req.auth.clientId,
+          options.incomingArtifactAdapters ?? [],
         );
         await server.connect(transport);
       } else {
