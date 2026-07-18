@@ -1,8 +1,8 @@
 # Artifact Exchange
 
-DevSpace Artifact Exchange is a generic, private byte-transfer foundation for
-MCP hosts that cannot provide an attached file as a host-visible path. It is
-opt-in and independent of any product-specific import or publishing behavior.
+DevSpace Artifact Exchange is an opt-in, private, bidirectional byte-transfer
+surface for MCP hosts and local workspaces. It is generic: staging or exporting
+an artifact does not import, execute, publish, or otherwise interpret it.
 
 Enable it with:
 
@@ -16,9 +16,9 @@ The default private root is:
 ~/.local/share/devspace/artifacts
 ```
 
-The SQLite state database remains authoritative for records and upload
-sessions. Immutable content objects are addressed by their server-computed
-SHA-256 digest.
+The SQLite state database is authoritative for upload sessions and artifact
+records. Canonical content objects are immutable and addressed by the
+server-computed SHA-256 digest.
 
 ## Native File Staging
 
@@ -43,10 +43,11 @@ a write destination.
 
 A successful stage streams through the same byte limits, total quota,
 server-side SHA-256, private partial-file, and atomic content-addressed commit
-pipeline as the fallback upload tools. The result contains only the artifact
-ID, sanitized name, MIME hint, byte size, SHA-256, host path, expiry, and a
+pipeline as the fallback upload tools. The result contains the artifact ID,
+sanitized name, MIME hint, byte size, SHA-256, verified materialized host path,
+expiry, MCP resource link, tokenless bearer-protected download reference, and a
 short instruction. It never returns file content, base64, bearer credentials,
-or presigned URLs.
+or presigned query parameters.
 
 Adapters are injected explicitly when constructing the server:
 
@@ -123,15 +124,11 @@ Call `artifact_upload_begin` with a safe filename and optional MIME hint,
 expected decoded size, expected SHA-256, workspace association, and artifact
 TTL.
 
-The result contains:
+The result contains an opaque `uploadId`, a decoded chunk limit of 49,152 bytes
+(48 KiB), the incomplete-upload expiry time, and `nextOffset: 0`.
 
-- an opaque `uploadId`
-- a decoded chunk limit of 49,152 bytes (48 KiB)
-- the incomplete-upload expiry time
-- `nextOffset: 0`
-
-A workspace ID is metadata only. Beginning an upload never writes into a
-workspace.
+A workspace ID is metadata only. Beginning or committing an upload never writes
+into a workspace.
 
 ### 2. Upload Sequential Chunks
 
@@ -146,94 +143,166 @@ Call `artifact_upload_chunk` with:
 ```
 
 `dataBase64` must be canonical standard base64 and decode to no more than 48
-KiB. The offset must equal the current decoded byte count.
-
-V1 is deliberately sequential. Out-of-order chunks fail. Repeating the most
-recently committed chunk at the same offset is safe only when the decoded bytes
-are identical; DevSpace acknowledges that retry without appending it again.
-Conflicting retries fail.
+KiB. V1 is sequential. The offset must equal the current decoded byte count.
+Repeating the most recently committed chunk is safe only when the bytes are
+identical; conflicting or out-of-order data fails.
 
 ### 3. Commit
 
 Call `artifact_upload_commit` after all bytes have been uploaded. DevSpace
-validates the declared size and optional digest, computes SHA-256 server-side,
-and atomically promotes the partial file into immutable content-addressed
-storage.
+validates the declared size and digest, computes SHA-256 server-side, atomically
+promotes the partial file into immutable content-addressed storage, and creates
+a private presentation copy with the sanitized original filename.
 
-The result contains metadata only:
+A committed or inspected artifact result includes:
 
 ```json
 {
   "artifactId": "art_...",
-  "name": "report.bin",
-  "mimeType": "application/octet-stream",
+  "name": "report.md",
+  "mimeType": "text/markdown",
   "size": 61432,
   "sha256": "sha256:...",
-  "hostPath": "/home/user/.local/share/devspace/artifacts/objects/...",
+  "hostPath": "/home/user/.local/share/devspace/artifacts/materialized/art_.../report.md",
   "source": "chunked",
   "createdAt": "...",
   "expiresAt": "...",
-  "pinned": false
+  "pinned": false,
+  "resourceUri": "https://devspace.example/artifacts/art_...",
+  "downloadUrl": "https://devspace.example/artifacts/art_..."
 }
 ```
 
-Only paths returned by an artifact tool are valid artifact capability paths.
-Agents must not invent paths under the artifact root.
+`hostPath` is a verified materialized presentation path. Canonical objects stay
+under the digest-addressed object tree. Only paths returned by artifact tools
+are valid outside-workspace capability paths; agents must never invent paths
+under the artifact root.
+
+`resourceUri` and `downloadUrl` identify the same bearer-protected route. They
+do not contain access tokens or signed query parameters.
 
 ### 4. Abort, Inspect, or Delete
 
 - `artifact_upload_abort` removes an incomplete upload.
-- `artifact_stat` returns metadata for an artifact owned by the authenticated
-  OAuth client.
-- `artifact_delete` deletes the record and removes the immutable object only
-  when no other live record references it.
+- `artifact_stat` returns owner-scoped metadata, restores or verifies the
+  materialized presentation path, and returns the protected resource link.
+- `artifact_delete` deletes the record and its materialized presentation path.
+  The canonical object is removed only when no other live record references it.
+
+## Copying an Artifact into a Workspace
+
+`artifact_copy_to_workspace` is explicit and opt-in:
+
+```json
+{
+  "workspaceId": "ws_...",
+  "artifactId": "art_...",
+  "destination": "reports/report.md",
+  "onConflict": "error"
+}
+```
+
+`onConflict` must be one of:
+
+- `error` — fail without modifying an existing destination;
+- `rename` — choose the first available `name (N).ext` destination;
+- `replace` — atomically replace an existing regular file.
+
+The operation uses the canonical verified object, not a mutable presentation
+copy. It resolves the destination through the existing workspace guard, creates
+parents only inside that workspace, rejects symlink/non-directory parents,
+copies atomically, verifies the final size and SHA-256, and writes a
+non-executable `0644` file.
+
+Copying may dirty a source repository. DevSpace never copies artifacts into a
+workspace automatically.
+
+## Exporting a Workspace File
+
+`artifact_export_from_workspace` is the reverse seam:
+
+```json
+{
+  "workspaceId": "ws_...",
+  "path": "exports/report.pdf",
+  "ttlHours": 24
+}
+```
+
+Only a contained regular non-symlink file is accepted. DevSpace reads it through
+a no-follow handle, verifies that it did not change during transfer, computes
+SHA-256 server-side, stages a private copy outside the repository, and returns
+the normal artifact metadata, resource link, and protected download reference.
+
+Export does not alter the source file, create a staging directory in the
+workspace, or dirty the repository.
+
+## Protected Downloads
+
+When Artifact Exchange is enabled, DevSpace exposes:
+
+```text
+GET /artifacts/:artifactId
+HEAD /artifacts/:artifactId
+```
+
+The route uses the same OAuth bearer boundary and resource validation as MCP.
+The authenticated OAuth client must own the record. Partial uploads are not
+addressable and the artifact root is never exposed through `express.static`.
+
+Responses use:
+
+- `Content-Disposition: attachment` with a safe fallback and UTF-8 filename;
+- an allowlisted content type, otherwise `application/octet-stream`;
+- `X-Content-Type-Options: nosniff`;
+- `Cache-Control: private, no-store`;
+- the recorded byte length.
+
+Do not place bearer tokens in URLs, logs, tool arguments, or command lines.
 
 ## Storage and Lifecycle
 
-Default limits are 100 MiB per artifact, 1 GiB total storage, and a 24-hour TTL
-for committed unpinned records. Incomplete uploads expire after one hour.
+Default limits are 100 MiB per artifact, 1 GiB total canonical storage, and a
+24-hour TTL for committed unpinned records. Incomplete uploads expire after one
+hour.
 
-Cleanup runs once at startup and every 15 minutes. Each pass is bounded so a
-large stale backlog cannot monopolize the server. Cleanup preserves pinned
-records and immutable objects referenced by another live record.
+Cleanup runs at startup and every 15 minutes. Each pass is bounded. Cleanup
+removes expired records and materialized paths while preserving pinned records
+and canonical objects referenced by another live record.
 
-`devspace doctor` reports:
-
-```text
-Artifact exchange: enabled
-Artifact root: ...
-Artifact storage: ... / ...
-Pending uploads: ...
-Expired artifacts awaiting cleanup: ...
-```
+`devspace doctor` reports the configured root, canonical storage use, pending
+uploads, and expired artifacts awaiting cleanup.
 
 ## Security Boundaries
 
-The store enforces:
+The exchange enforces:
 
-- server-selected paths
-- one normalized, non-hidden basename as metadata
-- byte limits during upload, not only at commit
-- total quota including pending decoded bytes
-- server-computed SHA-256
-- mode `0700` roots and object directories
-- mode `0600` partial and object files
-- no-follow file opens where supported
-- symlink and non-regular-file rejection
-- lexical and realpath containment checks
-- atomic promotion into immutable object storage
-- OAuth-client ownership for uploads and records
-- logs and results without raw artifact content or base64 chunks
+- server-selected canonical and temporary paths;
+- one normalized, non-hidden basename as metadata;
+- byte limits during transfer;
+- total quota including pending decoded bytes;
+- server-computed SHA-256 and verification on materialization/copy/download;
+- mode `0700` private directories;
+- mode `0600` canonical, partial, and materialized files;
+- mode `0644` non-executable workspace copies;
+- no-follow opens where supported;
+- symlink and non-regular-file rejection;
+- lexical and realpath containment checks;
+- atomic promotion and workspace replacement;
+- OAuth-client ownership for uploads, records, resources, and downloads;
+- logs and tool results without raw artifact content, base64 chunks, bearer
+  tokens, or tokenized URLs.
 
 The MIME type is only a hint. DevSpace does not inspect archives, execute
 content, fetch arbitrary URLs, serve an unauthenticated download route, widen
-workspace roots, or automatically publish artifacts.
+workspace roots, automatically publish artifacts, or treat the exchange as
+permanent storage.
 
 ## Current Non-Goals
 
-This foundation does not yet include a validated production host-specific
-native file adapter, workspace copy/export tools, authenticated download
-resources, archive handling, malware scanning, or permanent storage. The
-`stage_artifact` boundary and probe harness do not claim connector
-compatibility by themselves. Those capabilities require separate design and
-testing rather than expanding this transfer seam implicitly.
+This implementation does not include a validated production host-specific
+native file adapter, archive handling, malware scanning, automatic project
+copying, or permanent storage. The `stage_artifact` boundary and probe harness
+do not claim connector compatibility by themselves. Those capabilities require
+separate design and testing rather than expanding this transfer seam
+implicitly.

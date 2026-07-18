@@ -1,7 +1,13 @@
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 import type { ServerConfig } from "./config.js";
+import { artifactDownloadUrl } from "./artifact-download.js";
+import {
+  copyArtifactToWorkspace,
+  exportArtifactFromWorkspace,
+} from "./artifact-workspace.js";
 import {
   ARTIFACT_CHUNK_BYTES,
   ArtifactError,
@@ -13,6 +19,7 @@ import {
   type IncomingArtifactAdapter,
 } from "./incoming-artifacts.js";
 import { logEvent } from "./logger.js";
+import type { WorkspaceRegistry } from "./workspaces.js";
 
 const ARTIFACT_TOOL_META = { _meta: {} };
 
@@ -35,6 +42,8 @@ const artifactRecordOutputSchema = {
   createdAt: z.string(),
   expiresAt: z.string().optional(),
   pinned: z.boolean(),
+  resourceUri: z.string(),
+  downloadUrl: z.string(),
 };
 
 type ArtifactToolName =
@@ -44,11 +53,14 @@ type ArtifactToolName =
   | "artifact_upload_commit"
   | "artifact_upload_abort"
   | "artifact_stat"
+  | "artifact_copy_to_workspace"
+  | "artifact_export_from_workspace"
   | "artifact_delete";
 
 export interface ArtifactToolRegistrationOptions {
   config: ServerConfig;
   store: ArtifactStore;
+  workspaces: WorkspaceRegistry;
   clientId: string;
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
 }
@@ -69,6 +81,8 @@ export interface StageArtifactResult {
   sha256: string;
   hostPath: string;
   expiresAt?: string;
+  resourceUri?: string;
+  downloadUrl?: string;
   instruction: string;
 }
 
@@ -77,6 +91,7 @@ export function registerArtifactTools(
   {
     config,
     store,
+    workspaces,
     clientId,
     incomingArtifactAdapters = [],
   }: ArtifactToolRegistrationOptions,
@@ -105,18 +120,23 @@ export function registerArtifactTools(
         sha256: z.string(),
         hostPath: z.string(),
         expiresAt: z.string().optional(),
+        resourceUri: z.string(),
+        downloadUrl: z.string(),
         instruction: z.string(),
       },
       ...ARTIFACT_TOOL_META,
       annotations: ARTIFACT_WRITE_ANNOTATIONS,
     },
     async (input) => executeArtifactTool(config, "stage_artifact", input, async () => {
-      return stageIncomingArtifact({
-        store,
-        clientId,
-        registry: incomingRegistry,
-        input,
-      });
+      return withStageArtifactReferences(
+        config,
+        await stageIncomingArtifact({
+          store,
+          clientId,
+          registry: incomingRegistry,
+          input,
+        }),
+      );
     }),
   );
 
@@ -181,7 +201,7 @@ export function registerArtifactTools(
     {
       title: "Commit artifact upload",
       description:
-        "Validate the declared size and digest, compute SHA-256 server-side, and atomically promote the partial upload into immutable content-addressed storage.",
+        "Validate the declared size and digest, compute SHA-256 server-side, atomically promote the upload, and return a safe materialized filename path plus protected download reference.",
       inputSchema: {
         uploadId: z.string(),
       },
@@ -193,7 +213,7 @@ export function registerArtifactTools(
       config,
       "artifact_upload_commit",
       { uploadId },
-      async () => store.commitUpload(clientId, uploadId),
+      async () => withArtifactReferences(config, await store.commitUpload(clientId, uploadId)),
     ),
   );
 
@@ -226,7 +246,8 @@ export function registerArtifactTools(
     "artifact_stat",
     {
       title: "Inspect artifact",
-      description: "Return private artifact metadata by ID without returning its content.",
+      description:
+        "Return private artifact metadata, a safe materialized host path, and a protected download reference by artifact ID without returning its content inline.",
       inputSchema: {
         artifactId: z.string(),
       },
@@ -238,7 +259,88 @@ export function registerArtifactTools(
       config,
       "artifact_stat",
       { artifactId },
-      async () => store.statArtifact(clientId, artifactId),
+      async () => withArtifactReferences(config, await store.statArtifact(clientId, artifactId)),
+    ),
+  );
+
+  registerAppTool(
+    server,
+    "artifact_copy_to_workspace",
+    {
+      title: "Copy artifact to workspace",
+      description:
+        "Opt in to copying one private artifact into an open workspace. The destination is contained by the existing workspace guard; parent directories are created only inside that workspace. Conflict handling must be selected explicitly. This may dirty a repository.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+        artifactId: z.string(),
+        destination: z.string().min(1).describe("Destination path relative to the workspace root, or an absolute path inside it."),
+        onConflict: z.enum(["error", "rename", "replace"]),
+      },
+      outputSchema: {
+        artifactId: z.string(),
+        workspaceId: z.string(),
+        path: z.string(),
+        size: z.number().int().nonnegative(),
+        sha256: z.string(),
+        onConflict: z.enum(["error", "rename", "replace"]),
+        renamed: z.boolean(),
+      },
+      ...ARTIFACT_TOOL_META,
+      annotations: ARTIFACT_WRITE_ANNOTATIONS,
+    },
+    async (input) => executeArtifactTool(
+      config,
+      "artifact_copy_to_workspace",
+      input,
+      async () => {
+        const workspace = workspaces.getWorkspace(input.workspaceId);
+        const destination = workspaces.resolvePath(workspace, input.destination);
+        return copyArtifactToWorkspace({
+          store,
+          clientId,
+          workspaceId: input.workspaceId,
+          workspaceRoot: workspace.root,
+          artifactId: input.artifactId,
+          destination,
+          onConflict: input.onConflict,
+        });
+      },
+    ),
+  );
+
+  registerAppTool(
+    server,
+    "artifact_export_from_workspace",
+    {
+      title: "Export workspace file",
+      description:
+        "Copy one regular, contained workspace file into the private Artifact Exchange without modifying the workspace. Returns metadata, a resource link, and a bearer-protected download URL.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+        path: z.string().min(1).describe("Regular file path inside the workspace."),
+        ttlHours: z.number().int().min(1).max(24 * 365).optional(),
+      },
+      outputSchema: artifactRecordOutputSchema,
+      ...ARTIFACT_TOOL_META,
+      annotations: ARTIFACT_WRITE_ANNOTATIONS,
+    },
+    async (input) => executeArtifactTool(
+      config,
+      "artifact_export_from_workspace",
+      input,
+      async () => {
+        const workspace = workspaces.getWorkspace(input.workspaceId);
+        const path = workspaces.resolvePath(workspace, input.path);
+        const artifact = await exportArtifactFromWorkspace({
+          store,
+          clientId,
+          workspaceId: input.workspaceId,
+          workspaceRoot: workspace.root,
+          path,
+          ttlHours: input.ttlHours,
+        });
+        return withArtifactReferences(config, artifact);
+      },
     ),
   );
 
@@ -248,7 +350,7 @@ export function registerArtifactTools(
     {
       title: "Delete artifact",
       description:
-        "Delete an artifact record. Its immutable object is removed only when no other live record references it.",
+        "Delete an artifact record and its materialized presentation path. Its immutable object is removed only when no other live record references it.",
       inputSchema: {
         artifactId: z.string(),
       },
@@ -379,6 +481,19 @@ export function artifactToolLogFields(
     case "artifact_stat":
     case "artifact_delete":
       return { artifactId: input.artifactId };
+    case "artifact_copy_to_workspace":
+      return {
+        artifactId: input.artifactId,
+        workspaceId: input.workspaceId,
+        destination: input.destination,
+        onConflict: input.onConflict,
+      };
+    case "artifact_export_from_workspace":
+      return {
+        workspaceId: input.workspaceId,
+        path: input.path,
+        ttlHours: input.ttlHours,
+      };
   }
 }
 
@@ -416,9 +531,48 @@ async function executeArtifactTool<T extends object>(
 }
 
 function artifactToolResponse<T extends object>(result: T) {
+  const structuredContent = result as Record<string, unknown>;
+  const content: ContentBlock[] = [
+    { type: "text", text: JSON.stringify(result) },
+  ];
+  if (
+    typeof structuredContent.resourceUri === "string"
+    && typeof structuredContent.name === "string"
+  ) {
+    content.push({
+      type: "resource_link",
+      uri: structuredContent.resourceUri,
+      name: structuredContent.name,
+      mimeType: typeof structuredContent.mimeType === "string"
+        ? structuredContent.mimeType
+        : "application/octet-stream",
+      size: typeof structuredContent.size === "number"
+        ? structuredContent.size
+        : undefined,
+      description: "Private DevSpace artifact. Fetch with the authenticated bearer boundary.",
+    });
+  }
+  return { content, structuredContent };
+}
+
+function withArtifactReferences(config: ServerConfig, artifact: ArtifactRecord) {
+  const downloadUrl = artifactDownloadUrl(config.publicBaseUrl, artifact.artifactId);
   return {
-    content: [{ type: "text" as const, text: JSON.stringify(result) }],
-    structuredContent: result as Record<string, unknown>,
+    ...artifact,
+    resourceUri: downloadUrl,
+    downloadUrl,
+  };
+}
+
+function withStageArtifactReferences(
+  config: ServerConfig,
+  artifact: StageArtifactResult,
+): StageArtifactResult & { resourceUri: string; downloadUrl: string } {
+  const downloadUrl = artifactDownloadUrl(config.publicBaseUrl, artifact.artifactId);
+  return {
+    ...artifact,
+    resourceUri: downloadUrl,
+    downloadUrl,
   };
 }
 
@@ -427,11 +581,14 @@ function artifactResultLogFields(result: Record<string, unknown>): Record<string
   return {
     artifactId: artifact.artifactId,
     uploadId: result.uploadId,
+    workspaceId: result.workspaceId,
+    path: result.path,
     size: artifact.size,
     sha256: artifact.sha256,
     source: artifact.source,
     receivedBytes: result.receivedBytes,
     retry: result.retry,
+    renamed: result.renamed,
     objectDeleted: result.objectDeleted,
   };
 }

@@ -191,7 +191,7 @@ async function testStageArtifact(testRoot: string): Promise<void> {
     assert.match(result.instruction, /artifact_copy_to_workspace/);
     assert.deepEqual(await readFile(result.hostPath), bytes);
 
-    const record = store.statArtifact("client-a", result.artifactId);
+    const record = await store.statArtifact("client-a", result.artifactId);
     assert.equal(record.source, "incoming:local-fixture");
     assert.equal(record.workspaceId, "ws_association_only");
     assert.equal(record.pinned, true);

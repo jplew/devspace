@@ -19,6 +19,7 @@ import type { Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch } from "./apply-patch.js";
 import { registerArtifactTools } from "./artifact-tools.js";
+import { handleArtifactDownload } from "./artifact-download.js";
 import {
   ARTIFACT_CLEANUP_INTERVAL_MS,
   ArtifactStore,
@@ -186,7 +187,7 @@ interface ToolLogFields {
 
 function serverInstructions(config: ServerConfig): string {
   const artifactInstruction = config.artifactsEnabled
-    ? " When the user supplies or generates a file that is not present on the DevSpace host, use stage_artifact instead of recreating it through write/edit calls. Paths returned by artifact tools may be passed to local commands. Use artifact_copy_to_workspace only when the file should become part of the project. If the MCP host cannot supply a native file reference, use the artifact_upload_begin, artifact_upload_chunk, artifact_upload_commit, and artifact_upload_abort fallback. Only use host paths returned by artifact tools; never invent artifact-store paths or place artifact content/base64 in shell commands or logs."
+    ? " When the user supplies or generates a file that is not present on the DevSpace host, prefer stage_artifact instead of recreating it through write/edit calls. If the MCP host cannot supply a native file reference, use the artifact_upload_begin, artifact_upload_chunk, artifact_upload_commit, and artifact_upload_abort fallback. Use artifact_stat, artifact_copy_to_workspace, artifact_export_from_workspace, and artifact_delete for inspection and explicit lifecycle operations. Only host paths returned by artifact tools are valid outside-workspace capability paths; never invent artifact-store paths or place artifact content/base64 in shell commands or logs. Copying into a workspace is opt-in and may dirty a repository. Exporting a contained regular workspace file stages a private copy without modifying the workspace."
     : "";
   const showChangesInstruction =
     config.widgets === "changes"
@@ -1610,6 +1611,7 @@ function createMcpServer(
     registerArtifactTools(server, {
       config,
       store: artifactStore,
+      workspaces,
       clientId,
       incomingArtifactAdapters,
     });
@@ -1756,6 +1758,19 @@ export function createServer(
   app.get("/healthz", (_req, res) => {
     res.json({ ok: true, name: "devspace" });
   });
+
+  if (artifactStore) {
+    app.get(
+      "/artifacts/:artifactId",
+      bearerAuth,
+      async (req, res) => {
+        await handleArtifactDownload(req, res, {
+          store: artifactStore,
+          resourceServerUrl,
+        });
+      },
+    );
+  }
 
   app.all("/mcp", async (req, res) => {
     const requestId = res.locals.requestId as string | undefined;
