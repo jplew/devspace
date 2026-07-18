@@ -82,6 +82,11 @@ export interface ArtifactRecord {
   pinned: boolean;
 }
 
+export interface ArtifactCommitOptions {
+  source?: string;
+  pinned?: boolean;
+}
+
 export interface ArtifactDeleteResult {
   artifactId: string;
   deleted: boolean;
@@ -356,11 +361,17 @@ export class ArtifactStore {
     });
   }
 
-  commitUpload(clientId: string, uploadId: string): Promise<ArtifactRecord> {
+  commitUpload(
+    clientId: string,
+    uploadId: string,
+    options: ArtifactCommitOptions = {},
+  ): Promise<ArtifactRecord> {
     return this.withMutation(async () => {
       const row = this.requireUpload(clientId, uploadId);
       this.assertUploadActive(row);
       this.assertUploadNotExpired(row);
+      const source = normalizeArtifactSource(options.source);
+      const pinned = options.pinned === true;
       const partialStat = await assertExistingFileContained(
         row.temp_path,
         this.uploadsRoot,
@@ -422,7 +433,7 @@ export class ArtifactStore {
             id, client_id, workspace_id, original_name, mime_type,
             size, sha256, storage_path, source, status,
             created_at, expires_at, pinned, last_used_at
-          ) values (?, ?, ?, ?, ?, ?, ?, ?, 'chunked', 'available', ?, ?, 0, ?)
+          ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', ?, ?, ?, ?)
         `).run(
           artifactId,
           clientId,
@@ -432,8 +443,10 @@ export class ArtifactStore {
           row.received_size,
           digest,
           objectPath,
+          source,
           now.toISOString(),
           expiresAt,
+          pinned ? 1 : 0,
           now.toISOString(),
         );
         this.database.sqlite.prepare("delete from artifact_uploads where id = ? and client_id = ?")
@@ -458,11 +471,11 @@ export class ArtifactStore {
         size: row.received_size,
         sha256: `sha256:${digest}`,
         hostPath: objectPath,
-        source: "chunked",
+        source,
         workspaceId: row.workspace_id ?? undefined,
         createdAt: now.toISOString(),
         expiresAt,
-        pinned: false,
+        pinned,
       };
     });
   }
@@ -703,6 +716,17 @@ export function normalizeArtifactFilename(value: string): string {
     );
   }
   return normalized;
+}
+
+function normalizeArtifactSource(value: string | undefined): string {
+  const source = value ?? "chunked";
+  if (!/^[a-z0-9][a-z0-9._:-]{0,63}$/u.test(source)) {
+    throw new ArtifactError(
+      "invalid_artifact_source",
+      "Artifact source must be a short lowercase identifier.",
+    );
+  }
+  return source;
 }
 
 export function normalizeSha256(value: string | undefined): string | undefined {

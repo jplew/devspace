@@ -111,6 +111,14 @@ version remains under the existing owner-only `devspace` scope. It does not add
 an unauthenticated download route or expose the artifact root with
 `express.static`.
 
+Native staging is adapter-gated. The opaque `stage_artifact.file` value is
+never treated as a URL or path merely because it contains a string. Exactly one
+explicitly registered trusted adapter must recognize it; zero or multiple
+matches fail closed. The production server has no host-specific adapter by
+default until the real connector shape is validated. Probe captures stay
+process-local, and only a redacted type/key/length summary is suitable for logs
+or fixtures.
+
 The exchange deliberately does not:
 
 - fetch arbitrary URLs
@@ -132,5 +140,7 @@ disabled unless `DEVSPACE_LOG_SHELL_COMMANDS=1`.
 Do not enable shell command logging if commands may contain secrets.
 
 Artifact tool logs contain identifiers, names, MIME hints, byte counts, hashes,
-and status fields. Raw content and base64 chunks are never included in tool
-logs or tool results.
+and status fields. `stage_artifact` logs only whether a file value and expected
+digest were supplied plus non-sensitive options; it does not log the opaque
+file value. Raw content, connector references, bearer credentials, presigned
+URLs, and base64 chunks are never included in tool logs or tool results.

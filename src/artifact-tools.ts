@@ -8,6 +8,10 @@ import {
   type ArtifactRecord,
   type ArtifactStore,
 } from "./artifacts.js";
+import {
+  IncomingArtifactAdapterRegistry,
+  type IncomingArtifactAdapter,
+} from "./incoming-artifacts.js";
 import { logEvent } from "./logger.js";
 
 const ARTIFACT_TOOL_META = { _meta: {} };
@@ -34,6 +38,7 @@ const artifactRecordOutputSchema = {
 };
 
 type ArtifactToolName =
+  | "stage_artifact"
   | "artifact_upload_begin"
   | "artifact_upload_chunk"
   | "artifact_upload_commit"
@@ -45,12 +50,76 @@ export interface ArtifactToolRegistrationOptions {
   config: ServerConfig;
   store: ArtifactStore;
   clientId: string;
+  incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+}
+
+export interface StageArtifactInput {
+  file: unknown;
+  workspaceId?: string;
+  expectedSha256?: string;
+  ttlHours?: number;
+  pin?: boolean;
+}
+
+export interface StageArtifactResult {
+  artifactId: string;
+  name: string;
+  mimeType?: string;
+  size: number;
+  sha256: string;
+  hostPath: string;
+  expiresAt?: string;
+  instruction: string;
 }
 
 export function registerArtifactTools(
   server: McpServer,
-  { config, store, clientId }: ArtifactToolRegistrationOptions,
+  {
+    config,
+    store,
+    clientId,
+    incomingArtifactAdapters = [],
+  }: ArtifactToolRegistrationOptions,
 ): void {
+  const incomingRegistry = new IncomingArtifactAdapterRegistry(incomingArtifactAdapters);
+
+  registerAppTool(
+    server,
+    "stage_artifact",
+    {
+      title: "Stage attached or generated file",
+      description:
+        "Stage one host-provided native file reference into the private Artifact Exchange. Only explicitly registered trusted adapters may recognize the opaque file value; arbitrary URLs and paths fail closed. A workspace ID is association metadata, not a write destination.",
+      inputSchema: {
+        file: z.unknown().describe("Opaque top-level file value supplied by the MCP client or connector."),
+        workspaceId: z.string().min(1).optional().describe("Optional workspace association; never a write destination."),
+        expectedSha256: z.string().optional().describe("Optional expected SHA-256, with or without a sha256: prefix."),
+        ttlHours: z.number().int().min(1).max(24 * 365).optional().describe("Artifact lifetime after staging."),
+        pin: z.boolean().optional().describe("Preserve the artifact until explicitly deleted."),
+      },
+      outputSchema: {
+        artifactId: z.string(),
+        name: z.string(),
+        mimeType: z.string().optional(),
+        size: z.number().int().nonnegative(),
+        sha256: z.string(),
+        hostPath: z.string(),
+        expiresAt: z.string().optional(),
+        instruction: z.string(),
+      },
+      ...ARTIFACT_TOOL_META,
+      annotations: ARTIFACT_WRITE_ANNOTATIONS,
+    },
+    async (input) => executeArtifactTool(config, "stage_artifact", input, async () => {
+      return stageIncomingArtifact({
+        store,
+        clientId,
+        registry: incomingRegistry,
+        input,
+      });
+    }),
+  );
+
   registerAppTool(
     server,
     "artifact_upload_begin",
@@ -200,11 +269,95 @@ export function registerArtifactTools(
   );
 }
 
+export async function stageIncomingArtifact({
+  store,
+  clientId,
+  registry,
+  input,
+}: {
+  store: ArtifactStore;
+  clientId: string;
+  registry: IncomingArtifactAdapterRegistry;
+  input: StageArtifactInput;
+}): Promise<StageArtifactResult> {
+  const opened = await registry.open(input.file);
+  let uploadId: string | undefined;
+
+  try {
+    const upload = await store.beginUpload(clientId, {
+      filename: opened.name,
+      mimeType: opened.mimeType,
+      size: opened.size,
+      sha256: input.expectedSha256,
+      workspaceId: input.workspaceId,
+      ttlHours: input.ttlHours,
+    });
+    uploadId = upload.uploadId;
+
+    let offset = 0;
+    for await (const value of opened.stream) {
+      const bytes = incomingStreamChunk(value);
+      for (let chunkOffset = 0; chunkOffset < bytes.length; chunkOffset += ARTIFACT_CHUNK_BYTES) {
+        const chunk = bytes.subarray(chunkOffset, chunkOffset + ARTIFACT_CHUNK_BYTES);
+        await store.uploadChunk(clientId, {
+          uploadId,
+          offset,
+          dataBase64: chunk.toString("base64"),
+        });
+        offset += chunk.length;
+      }
+    }
+
+    const artifact = await store.commitUpload(clientId, uploadId, {
+      source: `incoming:${opened.adapterId}`,
+      pinned: input.pin === true,
+    });
+    uploadId = undefined;
+    return {
+      artifactId: artifact.artifactId,
+      name: artifact.name,
+      mimeType: artifact.mimeType,
+      size: artifact.size,
+      sha256: artifact.sha256,
+      hostPath: artifact.hostPath,
+      expiresAt: artifact.expiresAt,
+      instruction:
+        "Pass hostPath to a local command, or use artifact_copy_to_workspace only when the file should become part of a project.",
+    };
+  } catch (error) {
+    opened.stream.destroy();
+    if (uploadId) {
+      await store.abortUpload(clientId, uploadId).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+function incomingStreamChunk(value: unknown): Buffer {
+  if (Buffer.isBuffer(value)) return value;
+  if (typeof value === "string") return Buffer.from(value);
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  }
+  throw new ArtifactError(
+    "invalid_incoming_artifact_chunk",
+    "Incoming artifact stream yielded a value that is not bytes or text.",
+  );
+}
+
 export function artifactToolLogFields(
   tool: ArtifactToolName,
   input: Record<string, unknown>,
 ): Record<string, unknown> {
   switch (tool) {
+    case "stage_artifact":
+      return {
+        fileProvided: input.file !== undefined,
+        workspaceId: input.workspaceId,
+        expectedSha256Present: typeof input.expectedSha256 === "string",
+        ttlHours: input.ttlHours,
+        pin: input.pin === true,
+      };
     case "artifact_upload_begin":
       return {
         filename: input.filename,
