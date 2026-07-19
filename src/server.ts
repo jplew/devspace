@@ -25,7 +25,10 @@ import {
   ArtifactStore,
 } from "./artifacts.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
-import type { IncomingArtifactAdapter } from "./incoming-artifacts.js";
+import {
+  createOpenAIIncomingArtifactAdapter,
+  type IncomingArtifactAdapter,
+} from "./incoming-artifacts.js";
 import {
   logEvent,
   requestIp,
@@ -1628,6 +1631,8 @@ export function createServer(
   config = loadConfig(),
   options: CreateServerOptions = {},
 ): RunningServer {
+  const incomingArtifactAdapters = options.incomingArtifactAdapters
+    ?? [createOpenAIIncomingArtifactAdapter()];
   const allowedHosts = config.allowedHosts.includes("*")
     ? undefined
     : Array.from(new Set([config.host, ...config.allowedHosts]));
@@ -1845,7 +1850,7 @@ export function createServer(
           localAgentProviders,
           artifactStore,
           req.auth.clientId,
-          options.incomingArtifactAdapters ?? [],
+          incomingArtifactAdapters,
         );
         await server.connect(transport);
       } else {

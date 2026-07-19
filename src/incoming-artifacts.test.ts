@@ -4,13 +4,16 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
+import * as z from "zod/v4";
 import {
   artifactToolLogFields,
+  registerArtifactTools,
   stageIncomingArtifact,
 } from "./artifact-tools.js";
 import { ArtifactError, ArtifactStore } from "./artifacts.js";
 import {
   IncomingArtifactAdapterRegistry,
+  createOpenAIIncomingArtifactAdapter,
   createIncomingArtifactProbeAdapter,
   createLocalFixtureIncomingArtifactAdapter,
   describeIncomingArtifactValue,
@@ -22,6 +25,8 @@ const root = await mkdtemp(join(tmpdir(), "devspace-incoming-artifacts-test-"));
 
 try {
   await testRegistryFailsClosed();
+  testChatGPTFileDescriptor();
+  await testOpenAIFileAdapter(join(root, "openai"));
   await testExplicitLocalFixture(join(root, "fixture"));
   await testProbeHarness();
   await testStageArtifact(join(root, "stage"));
@@ -29,6 +34,157 @@ try {
   testStageLogRedaction();
 } finally {
   await rm(root, { recursive: true, force: true });
+}
+
+function testChatGPTFileDescriptor(): void {
+  const registered = new Map<string, Record<string, unknown>>();
+  const server = {
+    registerTool(
+      name: string,
+      descriptor: Record<string, unknown>,
+      _callback: unknown,
+    ) {
+      registered.set(name, descriptor);
+      return {};
+    },
+  };
+
+  registerArtifactTools(server as never, {
+    config: {} as never,
+    store: {} as never,
+    workspaces: {} as never,
+    clientId: "client-a",
+  });
+
+  const descriptor = registered.get("stage_artifact");
+  assert.ok(descriptor);
+  assert.deepEqual(descriptor._meta, { "openai/fileParams": ["file"] });
+
+  const inputSchema = descriptor.inputSchema as z.ZodRawShape;
+  const fileSchema = inputSchema.file as z.ZodType;
+  const valid = {
+    download_url: "https://files.oaiusercontent.com/file_123/download?sig=secret",
+    file_id: "file_123",
+    mime_type: "image/png",
+    file_name: "generated.png",
+  };
+  assert.deepEqual(fileSchema.parse(valid), valid);
+  assert.throws(() => fileSchema.parse({ file_id: "file_123" }));
+  assert.throws(() => fileSchema.parse({
+    ...valid,
+    mime_type: 123,
+  }));
+
+  const jsonSchema = z.toJSONSchema(fileSchema) as {
+    additionalProperties?: boolean;
+    properties?: Record<string, unknown>;
+    required?: string[];
+  };
+  assert.equal(jsonSchema.additionalProperties, false);
+  assert.deepEqual(Object.keys(jsonSchema.properties ?? {}).sort(), [
+    "download_url",
+    "file_id",
+    "file_name",
+    "mime_type",
+  ]);
+  assert.deepEqual([...(jsonSchema.required ?? [])].sort(), ["download_url", "file_id"]);
+}
+
+async function testOpenAIFileAdapter(testRoot: string): Promise<void> {
+  const bytes = Buffer.from("chatgpt generated image bytes");
+  const requested: string[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    requested.push(String(input));
+    assert.equal(init?.redirect, "manual");
+    return new Response(bytes, {
+      status: 200,
+      headers: {
+        "content-length": String(bytes.length),
+        "content-type": "image/png",
+      },
+    });
+  };
+  const registry = new IncomingArtifactAdapterRegistry([
+    createOpenAIIncomingArtifactAdapter({ fetch: fetchImpl }),
+  ]);
+  const reference = {
+    download_url: "https://files.oaiusercontent.com/file_123/download?sig=secret",
+    file_id: "file_123",
+    mime_type: "image/png",
+    file_name: "generated.png",
+  };
+  const opened = await registry.open(reference);
+  assert.equal(opened.adapterId, "openai-file");
+  assert.equal(opened.name, "generated.png");
+  assert.equal(opened.mimeType, "image/png");
+  assert.equal(opened.size, bytes.length);
+  assert.deepEqual(await collect(opened.stream), bytes);
+
+  const store = createStore(testRoot);
+  try {
+    const staged = await stageIncomingArtifact({
+      store,
+      clientId: "client-a",
+      registry,
+      input: { file: reference },
+    });
+    assert.equal(staged.name, "generated.png");
+    assert.equal(staged.mimeType, "image/png");
+    assert.deepEqual(await readFile(staged.hostPath), bytes);
+    assert.equal(
+      (await store.statArtifact("client-a", staged.artifactId)).source,
+      "incoming:openai-file",
+    );
+  } finally {
+    store.close();
+  }
+  assert.deepEqual(requested, [reference.download_url, reference.download_url]);
+
+  await expectArtifactError(
+    registry.open({
+      ...reference,
+      download_url: "https://example.test/private.png",
+    }),
+    "unsafe_openai_file_reference",
+  );
+  await expectArtifactError(
+    registry.open({
+      ...reference,
+      download_url: "http://files.oaiusercontent.com/file_123",
+    }),
+    "unsafe_openai_file_reference",
+  );
+  await expectArtifactError(
+    registry.open({
+      ...reference,
+      file_id: "not-a-file-id",
+    }),
+    "invalid_openai_file_reference",
+  );
+  await expectArtifactError(
+    registry.open({
+      ...reference,
+      bearer: "secret",
+    }),
+    "unsupported_incoming_artifact",
+  );
+
+  let redirectRequests = 0;
+  const redirectingFetch: typeof fetch = async () => {
+    redirectRequests += 1;
+    return new Response(null, {
+      status: 302,
+      headers: { location: "http://127.0.0.1/private" },
+    });
+  };
+  const redirectingRegistry = new IncomingArtifactAdapterRegistry([
+    createOpenAIIncomingArtifactAdapter({ fetch: redirectingFetch }),
+  ]);
+  await expectArtifactError(
+    redirectingRegistry.open(reference),
+    "unsafe_openai_file_reference",
+  );
+  assert.equal(redirectRequests, 1);
 }
 
 async function testRegistryFailsClosed(): Promise<void> {

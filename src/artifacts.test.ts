@@ -120,6 +120,13 @@ async function testBinaryRoundTrip(testRoot: string): Promise<void> {
     assert.equal(artifact.workspaceId, "ws_123");
     assert.deepEqual(await readFile(artifact.hostPath), bytes);
 
+    const replayedCommit = await store.commitUpload("client-a", begin.uploadId);
+    assert.deepEqual(replayedCommit, artifact);
+    await expectArtifactError(
+      store.commitUpload("client-b", begin.uploadId),
+      "upload_not_found",
+    );
+
     const inspected = await store.statArtifact("client-a", artifact.artifactId);
     assert.deepEqual(inspected, artifact);
     await expectArtifactError(
@@ -164,6 +171,7 @@ async function testRestartSafeUpload(testRoot: string): Promise<void> {
   initialStore.close();
 
   const resumedStore = createStore(testRoot);
+  let artifact: ArtifactRecord;
   try {
     const retry = await resumedStore.uploadChunk("client-a", {
       uploadId: upload.uploadId,
@@ -176,10 +184,18 @@ async function testRestartSafeUpload(testRoot: string): Promise<void> {
       offset: firstChunk.length,
       dataBase64: bytes.subarray(firstChunk.length).toString("base64"),
     });
-    const artifact = await resumedStore.commitUpload("client-a", upload.uploadId);
+    artifact = await resumedStore.commitUpload("client-a", upload.uploadId);
     assert.deepEqual(await readFile(artifact.hostPath), bytes);
   } finally {
     resumedStore.close();
+  }
+
+  const replayStore = createStore(testRoot);
+  try {
+    const replayed = await replayStore.commitUpload("client-a", upload.uploadId);
+    assert.deepEqual(replayed, artifact!);
+  } finally {
+    replayStore.close();
   }
 }
 
@@ -290,12 +306,22 @@ async function testExpirationAndPinning(testRoot: string): Promise<void> {
   const store = createStore(testRoot, {}, () => new Date(current));
   try {
     const abandoned = await store.beginUpload("client-a", { filename: "abandoned.bin" });
+    const receipt = await store.beginUpload("client-a", {
+      filename: "committed.bin",
+      size: 0,
+    });
+    const committed = await store.commitUpload("client-a", receipt.uploadId);
     current = new Date("2026-07-18T14:00:00.000Z");
     const uploadCleanup = await store.cleanupExpired();
     assert.equal(uploadCleanup.uploadsDeleted, 1);
+    assert.equal(uploadCleanup.receiptsDeleted, 1);
     await expectArtifactError(
       store.abortUpload("client-a", abandoned.uploadId),
       "upload_not_found",
+    );
+    assert.equal(
+      (await store.statArtifact("client-a", committed.artifactId)).artifactId,
+      committed.artifactId,
     );
 
     current = new Date("2026-07-18T12:00:00.000Z");

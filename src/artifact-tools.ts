@@ -30,6 +30,13 @@ const ARTIFACT_WRITE_ANNOTATIONS = {
   openWorldHint: false,
 };
 
+const openAIFileReferenceInputSchema = z.object({
+  download_url: z.string(),
+  file_id: z.string(),
+  mime_type: z.string().optional(),
+  file_name: z.string().optional(),
+});
+
 const artifactRecordOutputSchema = {
   artifactId: z.string(),
   name: z.string(),
@@ -104,9 +111,9 @@ export function registerArtifactTools(
     {
       title: "Stage attached or generated file",
       description:
-        "Stage one host-provided native file reference into the private Artifact Exchange. Only explicitly registered trusted adapters may recognize the opaque file value; arbitrary URLs and paths fail closed. A workspace ID is association metadata, not a write destination.",
+        "Stage one ChatGPT-provided native file reference into the private Artifact Exchange. DevSpace downloads only the exact file object authorized by ChatGPT; arbitrary URLs and paths fail closed. A workspace ID is association metadata, not a write destination.",
       inputSchema: {
-        file: z.unknown().describe("Opaque top-level file value supplied by the MCP client or connector."),
+        file: openAIFileReferenceInputSchema.describe("Native file value authorized and supplied by ChatGPT."),
         workspaceId: z.string().min(1).optional().describe("Optional workspace association; never a write destination."),
         expectedSha256: z.string().optional().describe("Optional expected SHA-256, with or without a sha256: prefix."),
         ttlHours: z.number().int().min(1).max(24 * 365).optional().describe("Artifact lifetime after staging."),
@@ -124,7 +131,7 @@ export function registerArtifactTools(
         downloadUrl: z.string(),
         instruction: z.string(),
       },
-      ...ARTIFACT_TOOL_META,
+      _meta: { "openai/fileParams": ["file"] },
       annotations: ARTIFACT_WRITE_ANNOTATIONS,
     },
     async (input) => executeArtifactTool(config, "stage_artifact", input, async () => {
@@ -207,7 +214,11 @@ export function registerArtifactTools(
       },
       outputSchema: artifactRecordOutputSchema,
       ...ARTIFACT_TOOL_META,
-      annotations: ARTIFACT_WRITE_ANNOTATIONS,
+      annotations: {
+        ...ARTIFACT_WRITE_ANNOTATIONS,
+        destructiveHint: false,
+        idempotentHint: true,
+      },
     },
     async ({ uploadId }) => executeArtifactTool(
       config,
