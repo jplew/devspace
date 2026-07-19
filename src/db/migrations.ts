@@ -27,6 +27,11 @@ const migrations: Migration[] = [
     name: "artifact-exchange",
     up: migrateArtifactExchange,
   },
+  {
+    version: 5,
+    name: "artifact-upload-receipts",
+    up: migrateArtifactUploadReceipts,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -234,6 +239,25 @@ function migrateArtifactExchange(sqlite: Database.Database): void {
 
     create index if not exists artifact_uploads_client_idx
       on artifact_uploads(client_id, created_at desc);
+  `);
+}
+
+function migrateArtifactUploadReceipts(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists artifact_upload_receipts (
+      upload_id text primary key,
+      client_id text not null,
+      artifact_id text not null,
+      committed_at text not null,
+      expires_at text not null,
+      foreign key (artifact_id) references artifacts(id) on delete cascade
+    );
+
+    create index if not exists artifact_upload_receipts_client_idx
+      on artifact_upload_receipts(client_id, committed_at desc);
+
+    create index if not exists artifact_upload_receipts_expiry_idx
+      on artifact_upload_receipts(expires_at);
   `);
 }
 

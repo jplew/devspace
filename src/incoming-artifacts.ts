@@ -1,11 +1,22 @@
 import { createReadStream } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute, basename, relative, resolve } from "node:path";
-import type { Readable } from "node:stream";
+import { Readable } from "node:stream";
+import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { ArtifactError } from "./artifacts.js";
 
 const LOCAL_FIXTURE_KIND = "devspace-local-fixture-v1";
 const ADAPTER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
+const OPENAI_FILE_HOST = "files.oaiusercontent.com";
+const OPENAI_FILE_ID_PATTERN = /^file[-_][A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u;
+const OPENAI_FILE_KEYS = new Set([
+  "download_url",
+  "file_id",
+  "mime_type",
+  "file_name",
+]);
+const OPENAI_FILE_REDIRECT_LIMIT = 3;
+const OPENAI_FILE_DOWNLOAD_TIMEOUT_MS = 30_000;
 
 export interface IncomingArtifactSource {
   name: string;
@@ -101,6 +112,86 @@ export interface LocalFixtureFileReference {
   relativePath: string;
   name?: string;
   mimeType?: string;
+}
+
+export interface OpenAIFileReference {
+  download_url: string;
+  file_id: string;
+  mime_type?: string;
+  file_name?: string;
+}
+
+export interface OpenAIIncomingArtifactAdapterOptions {
+  fetch?: typeof fetch;
+  timeoutMs?: number;
+}
+
+export function createOpenAIIncomingArtifactAdapter(
+  options: OpenAIIncomingArtifactAdapterOptions = {},
+): IncomingArtifactAdapter {
+  const fetchFile = options.fetch ?? globalThis.fetch;
+  const timeoutMs = options.timeoutMs ?? OPENAI_FILE_DOWNLOAD_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new ArtifactError(
+      "invalid_openai_file_adapter",
+      "OpenAI file download timeout must be a positive integer.",
+    );
+  }
+
+  return {
+    id: "openai-file",
+    canHandle: isOpenAIFileReferenceCandidate,
+    async open(value: unknown): Promise<IncomingArtifactSource> {
+      if (!isOpenAIFileReference(value)) {
+        throw new ArtifactError(
+          "invalid_openai_file_reference",
+          "ChatGPT file reference is malformed.",
+        );
+      }
+
+      let downloadUrl = validateOpenAIFileUrl(value.download_url);
+      let response: Response | undefined;
+      for (let redirect = 0; redirect <= OPENAI_FILE_REDIRECT_LIMIT; redirect += 1) {
+        try {
+          response = await fetchFile(downloadUrl, {
+            redirect: "manual",
+            signal: AbortSignal.timeout(timeoutMs),
+          });
+        } catch {
+          throw new ArtifactError(
+            "openai_file_download_failed",
+            "ChatGPT file could not be downloaded.",
+          );
+        }
+
+        if (!isRedirectStatus(response.status)) break;
+        const location = response.headers.get("location");
+        await response.body?.cancel().catch(() => undefined);
+        if (!location || redirect === OPENAI_FILE_REDIRECT_LIMIT) {
+          throw new ArtifactError(
+            "openai_file_download_failed",
+            "ChatGPT file download returned an invalid redirect.",
+          );
+        }
+        downloadUrl = validateOpenAIFileUrl(new URL(location, downloadUrl).toString());
+      }
+
+      if (!response?.ok || !response.body) {
+        await response?.body?.cancel().catch(() => undefined);
+        throw new ArtifactError(
+          "openai_file_download_failed",
+          "ChatGPT file download did not return file content.",
+        );
+      }
+
+      return {
+        name: value.file_name ?? `${value.file_id}.bin`,
+        mimeType: value.mime_type ?? responseMimeType(response),
+        size: responseContentLength(response),
+        stream: Readable.fromWeb(response.body as unknown as NodeReadableStream),
+      };
+    },
+  };
 }
 
 export async function createLocalFixtureIncomingArtifactAdapter(
@@ -312,6 +403,76 @@ function validateIncomingArtifactSource(source: IncomingArtifactSource): void {
       "Incoming artifact adapter must provide an async-readable stream.",
     );
   }
+}
+
+function isOpenAIFileReferenceCandidate(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length >= 2
+    && keys.every((key) => OPENAI_FILE_KEYS.has(key))
+    && Object.hasOwn(value, "download_url")
+    && Object.hasOwn(value, "file_id");
+}
+
+function isOpenAIFileReference(value: unknown): value is OpenAIFileReference {
+  return isOpenAIFileReferenceCandidate(value)
+    && typeof (value as Record<string, unknown>).download_url === "string"
+    && typeof (value as Record<string, unknown>).file_id === "string"
+    && OPENAI_FILE_ID_PATTERN.test((value as Record<string, string>).file_id)
+    && (
+      (value as Record<string, unknown>).mime_type === undefined
+      || typeof (value as Record<string, unknown>).mime_type === "string"
+    )
+    && (
+      (value as Record<string, unknown>).file_name === undefined
+      || typeof (value as Record<string, unknown>).file_name === "string"
+    );
+}
+
+function validateOpenAIFileUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new ArtifactError(
+      "unsafe_openai_file_reference",
+      "ChatGPT file download URL is invalid.",
+    );
+  }
+  if (
+    url.protocol !== "https:"
+    || url.hostname !== OPENAI_FILE_HOST
+    || (url.port !== "" && url.port !== "443")
+    || url.username !== ""
+    || url.password !== ""
+    || url.hash !== ""
+  ) {
+    throw new ArtifactError(
+      "unsafe_openai_file_reference",
+      "ChatGPT file download URL is outside the trusted file host.",
+    );
+  }
+  return url.toString();
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301
+    || status === 302
+    || status === 303
+    || status === 307
+    || status === 308;
+}
+
+function responseMimeType(response: Response): string | undefined {
+  const value = response.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  return value || undefined;
+}
+
+function responseContentLength(response: Response): number | undefined {
+  const value = response.headers.get("content-length");
+  if (!value || !/^\d+$/u.test(value)) return undefined;
+  const size = Number(value);
+  return Number.isSafeInteger(size) ? size : undefined;
 }
 
 function isLocalFixtureFileReference(value: unknown): value is LocalFixtureFileReference {

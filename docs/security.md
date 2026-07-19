@@ -127,13 +127,13 @@ atomically, re-verifies size and SHA-256, and strips executable permissions.
 Workspace export accepts only a contained regular non-symlink file and stages a
 private copy without modifying the workspace.
 
-Native staging is adapter-gated. The opaque `stage_artifact.file` value is
-never treated as a URL or path merely because it contains a string. Exactly one
-explicitly registered trusted adapter must recognize it; zero or multiple
-matches fail closed. The production server has no host-specific adapter by
-default until the real connector shape is validated. Probe captures stay
-process-local, and only a redacted type/key/length summary is suitable for logs
-or fixtures.
+Native staging is adapter-gated. The production server declares ChatGPT's
+top-level `openai/fileParams` contract and accepts only the documented
+`download_url`, `file_id`, `mime_type?`, and `file_name?` object. Downloads use
+HTTPS on `files.oaiusercontent.com`; credentials, fragments, alternate ports,
+arbitrary hosts, malformed IDs, extra fields, and redirects outside that same
+boundary fail closed. Probe captures for future hosts stay process-local, and
+only a redacted type/key/length summary is suitable for logs or fixtures.
 
 The exchange deliberately does not:
 
@@ -145,7 +145,9 @@ The exchange deliberately does not:
 - publish or permanently retain content
 
 MIME types are hints only. SHA-256 and byte counts are computed and enforced by
-the server. Pinned records require explicit deletion; unpinned records and
+the server. Successful chunked commits retain a one-hour owner-scoped receipt
+so response-loss retries return the same artifact; receipt cleanup never removes
+the artifact. Pinned records require explicit deletion; unpinned records and
 incomplete uploads remain subject to cleanup.
 
 ## Logs

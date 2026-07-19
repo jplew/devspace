@@ -64,16 +64,18 @@ When enabled, DevSpace exposes `stage_artifact`, `artifact_upload_begin`,
 `artifact_upload_chunk`, `artifact_upload_commit`, `artifact_upload_abort`,
 `artifact_stat`, `artifact_copy_to_workspace`,
 `artifact_export_from_workspace`, and `artifact_delete`. `stage_artifact`
-accepts an opaque native file value only through an explicitly injected trusted
-adapter; no host-specific adapter is enabled by default before connector
-validation. The fallback protocol accepts sequential canonical-base64 chunks of
-at most 48 KiB after decoding. Staged, committed, inspected, and exported
+declares ChatGPT's `openai/fileParams` contract and uses the default production
+adapter to stream validated `files.oaiusercontent.com` references. Tests or
+other hosts may explicitly replace the adapter list. The fallback protocol
+accepts sequential canonical-base64 chunks of at most 48 KiB after decoding.
+Staged, committed, inspected, and exported
 artifacts include a safe materialized filename path, an MCP resource link, and
 a bearer-protected `/artifacts/:artifactId` download reference. Copying into a
 workspace is explicit and may dirty a repository; exporting a contained regular
 file stages a private copy without modifying the workspace. Incomplete uploads
-expire after one hour. Cleanup runs at startup and periodically, with a bounded
-number of records processed per pass.
+and successful commit receipts expire after one hour; deleting a receipt never
+deletes its committed artifact. Cleanup runs at startup and periodically, with
+a bounded number of records processed per pass.
 
 Run `devspace doctor` to inspect the configured root, current storage use,
 pending uploads, and expired records awaiting cleanup. See

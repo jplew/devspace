@@ -125,6 +125,23 @@ export const artifactUploads = sqliteTable(
   ],
 );
 
+export const artifactUploadReceipts = sqliteTable(
+  "artifact_upload_receipts",
+  {
+    uploadId: text("upload_id").primaryKey(),
+    clientId: text("client_id").notNull(),
+    artifactId: text("artifact_id")
+      .notNull()
+      .references(() => artifacts.id, { onDelete: "cascade" }),
+    committedAt: text("committed_at").notNull(),
+    expiresAt: text("expires_at").notNull(),
+  },
+  (table) => [
+    index("artifact_upload_receipts_client_idx").on(table.clientId, table.committedAt),
+    index("artifact_upload_receipts_expiry_idx").on(table.expiresAt),
+  ],
+);
+
 export const localAgentSessions = sqliteTable(
   "local_agent_sessions",
   {
@@ -157,5 +174,7 @@ export type ArtifactRow = typeof artifacts.$inferSelect;
 export type NewArtifactRow = typeof artifacts.$inferInsert;
 export type ArtifactUploadRow = typeof artifactUploads.$inferSelect;
 export type NewArtifactUploadRow = typeof artifactUploads.$inferInsert;
+export type ArtifactUploadReceiptRow = typeof artifactUploadReceipts.$inferSelect;
+export type NewArtifactUploadReceiptRow = typeof artifactUploadReceipts.$inferInsert;
 export type LocalAgentSessionRow = typeof localAgentSessions.$inferSelect;
 export type NewLocalAgentSessionRow = typeof localAgentSessions.$inferInsert;

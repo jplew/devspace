@@ -45,6 +45,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 2, name: "oauth-state" },
       { version: 3, name: "local-agent-sessions" },
       { version: 4, name: "artifact-exchange" },
+      { version: 5, name: "artifact-upload-receipts" },
     ]);
   } finally {
     database.close();

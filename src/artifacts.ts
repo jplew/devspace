@@ -129,6 +129,7 @@ export interface ArtifactReadHandle extends ArtifactSource {
 
 export interface ArtifactCleanupResult {
   uploadsDeleted: number;
+  receiptsDeleted: number;
   artifactsDeleted: number;
   objectsDeleted: number;
   skippedUnsafePaths: number;
@@ -163,6 +164,14 @@ interface UploadRow {
   last_chunk_size: number | null;
   last_chunk_sha256: string | null;
   created_at: string;
+  expires_at: string;
+}
+
+interface UploadReceiptRow {
+  upload_id: string;
+  client_id: string;
+  artifact_id: string;
+  committed_at: string;
   expires_at: string;
 }
 
@@ -404,11 +413,17 @@ export class ArtifactStore {
     options: ArtifactCommitOptions = {},
   ): Promise<ArtifactRecord> {
     return this.withMutation(async () => {
-      const row = this.requireUpload(clientId, uploadId);
+      const row = this.findUpload(clientId, uploadId);
+      if (!row) return this.replayCommittedUpload(clientId, uploadId);
       this.assertUploadActive(row);
       this.assertUploadNotExpired(row);
       const source = normalizeArtifactSource(options.source);
       const pinned = options.pinned === true;
+      const committedAt = this.now();
+      const receiptExpiresAt = addHours(
+        committedAt,
+        ARTIFACT_UPLOAD_TTL_HOURS,
+      ).toISOString();
       const partialStat = await assertExistingFileContained(
         row.temp_path,
         this.uploadsRoot,
@@ -450,7 +465,18 @@ export class ArtifactStore {
           source,
           ttlHours: row.artifact_ttl_hours,
           pinned,
-          afterInsert: () => {
+          afterInsert: (artifactId) => {
+            this.database.sqlite.prepare(`
+              insert into artifact_upload_receipts (
+                upload_id, client_id, artifact_id, committed_at, expires_at
+              ) values (?, ?, ?, ?, ?)
+            `).run(
+              row.id,
+              clientId,
+              artifactId,
+              committedAt.toISOString(),
+              receiptExpiresAt,
+            );
             this.database.sqlite.prepare(
               "delete from artifact_uploads where id = ? and client_id = ?",
             ).run(row.id, clientId);
@@ -585,6 +611,7 @@ export class ArtifactStore {
       const now = this.now().toISOString();
       let remaining = this.cleanupLimit;
       let uploadsDeleted = 0;
+      let receiptsDeleted = 0;
       let artifactsDeleted = 0;
       let objectsDeleted = 0;
       let skippedUnsafePaths = 0;
@@ -605,6 +632,23 @@ export class ArtifactStore {
         this.incrementalHashes.delete(row.id);
         uploadsDeleted += 1;
         remaining -= 1;
+      }
+
+      if (remaining > 0) {
+        const expiredReceipts = this.database.sqlite.prepare(`
+          select * from artifact_upload_receipts
+          where expires_at <= ?
+          order by expires_at asc
+          limit ?
+        `).all(now, remaining) as UploadReceiptRow[];
+        const deleteReceipt = this.database.sqlite.prepare(
+          "delete from artifact_upload_receipts where upload_id = ?",
+        );
+        for (const receipt of expiredReceipts) {
+          deleteReceipt.run(receipt.upload_id);
+          receiptsDeleted += 1;
+          remaining -= 1;
+        }
       }
 
       if (remaining > 0) {
@@ -632,6 +676,7 @@ export class ArtifactStore {
 
       return {
         uploadsDeleted,
+        receiptsDeleted,
         artifactsDeleted,
         objectsDeleted,
         skippedUnsafePaths,
@@ -787,7 +832,7 @@ export class ArtifactStore {
     source: string;
     ttlHours: number;
     pinned: boolean;
-    afterInsert?: () => void;
+    afterInsert?: (artifactId: string) => void;
   }): Promise<ArtifactRecord> {
     const staged = await assertExistingFileContained(
       input.tempPath,
@@ -863,7 +908,7 @@ export class ArtifactStore {
           input.pinned ? 1 : 0,
           now.toISOString(),
         );
-        input.afterInsert?.();
+        input.afterInsert?.(artifactId);
       });
       insert.immediate();
     } catch (error) {
@@ -983,14 +1028,45 @@ export class ArtifactStore {
     await rmdir(directory);
   }
 
-  private requireUpload(clientId: string, uploadId: string): UploadRow {
-    const row = this.database.sqlite.prepare(
+  private findUpload(clientId: string, uploadId: string): UploadRow | undefined {
+    return this.database.sqlite.prepare(
       "select * from artifact_uploads where id = ? and client_id = ?",
     ).get(uploadId, clientId) as UploadRow | undefined;
+  }
+
+  private requireUpload(clientId: string, uploadId: string): UploadRow {
+    const row = this.findUpload(clientId, uploadId);
     if (!row) {
       throw new ArtifactError("upload_not_found", "Artifact upload was not found.");
     }
     return row;
+  }
+
+  private async replayCommittedUpload(
+    clientId: string,
+    uploadId: string,
+  ): Promise<ArtifactRecord> {
+    const receipt = this.database.sqlite.prepare(`
+      select * from artifact_upload_receipts
+      where upload_id = ? and client_id = ?
+    `).get(uploadId, clientId) as UploadReceiptRow | undefined;
+    if (!receipt) {
+      throw new ArtifactError("upload_not_found", "Artifact upload was not found.");
+    }
+    if (receipt.expires_at <= this.now().toISOString()) {
+      this.database.sqlite.prepare(`
+        delete from artifact_upload_receipts
+        where upload_id = ? and client_id = ?
+      `).run(uploadId, clientId);
+      throw new ArtifactError("upload_not_found", "Artifact upload was not found.");
+    }
+
+    const artifact = this.requireAvailableArtifact(clientId, receipt.artifact_id);
+    const hostPath = await this.ensureMaterializedArtifact(artifact);
+    this.database.sqlite.prepare(
+      "update artifacts set last_used_at = ? where id = ? and client_id = ?",
+    ).run(this.now().toISOString(), artifact.id, clientId);
+    return artifactRowToRecord(artifact, hostPath);
   }
 
   private requireArtifact(clientId: string, artifactId: string): ArtifactRow {

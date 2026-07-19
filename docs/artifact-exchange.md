@@ -22,12 +22,19 @@ server-computed SHA-256 digest.
 
 ## Native File Staging
 
-`stage_artifact` is the preferred action when an MCP host supplies an attached
-or generated file as a native top-level tool value:
+`stage_artifact` is the preferred action when ChatGPT supplies an attached or
+generated file as a native top-level tool value. The descriptor declares
+`_meta["openai/fileParams"] = ["file"]`, so ChatGPT authorizes and rewrites the
+field before invoking DevSpace:
 
 ```json
 {
-  "file": "<opaque host-provided value>",
+  "file": {
+    "download_url": "https://files.oaiusercontent.com/...",
+    "file_id": "file_...",
+    "mime_type": "image/png",
+    "file_name": "generated.png"
+  },
   "workspaceId": "optional association only",
   "expectedSha256": "sha256:...",
   "ttlHours": 24,
@@ -35,11 +42,12 @@ or generated file as a native top-level tool value:
 }
 ```
 
-The `file` value is deliberately opaque. DevSpace does not assume a ChatGPT,
-Claude, URL, mounted-path, or embedded-byte shape. It selects exactly one
-explicitly registered `IncomingArtifactAdapter`; zero matches fail closed, and
-multiple matches fail as ambiguous. A workspace ID is metadata only and never
-a write destination.
+The production OpenAI adapter accepts only the documented file object shape.
+`download_url` and `file_id` are required; `mime_type` and `file_name` are
+optional. Download URLs must use HTTPS on `files.oaiusercontent.com`, redirects
+are revalidated before they are followed, and arbitrary URLs, paths, extra
+credential fields, and malformed IDs fail closed. A workspace ID is metadata
+only and never a write destination.
 
 A successful stage streams through the same byte limits, total quota,
 server-side SHA-256, private partial-file, and atomic content-addressed commit
@@ -49,7 +57,8 @@ expiry, MCP resource link, tokenless bearer-protected download reference, and a
 short instruction. It never returns file content, base64, bearer credentials,
 or presigned query parameters.
 
-Adapters are injected explicitly when constructing the server:
+The production OpenAI adapter is enabled by default. Tests and custom hosts may
+replace the adapter list explicitly when constructing the server:
 
 ```ts
 createServer(config, {
@@ -71,9 +80,6 @@ interface IncomingArtifactAdapter {
   }>;
 }
 ```
-
-No host-specific adapter is enabled by default until its real connector value
-has been observed and reviewed.
 
 ### Deterministic Fixture and Probe Harness
 
@@ -109,12 +115,9 @@ put in tool results or logs. The redacted shape preserves ordinary structural
 keys and value classes while omitting string contents; unusual or long keys are
 replaced with placeholders so tokens and presigned URLs are not persisted.
 
-Remaining manual validation is intentionally separate from this code change:
-run the actual ChatGPT DevSpace connector in an approved maintenance window,
-attach a small benign file, inject the probe adapter, inspect the process-local
-capture, document a sanitized fixture, and then implement and review one
-trusted host-specific adapter. Until that happens, DevSpace makes no claim that
-`stage_artifact` accepts ChatGPT native file references.
+The probe remains available for future MCP hosts with different file contracts.
+It is not registered by the production server and must not be used as a generic
+URL or path adapter.
 
 ## Fallback Upload Protocol
 
@@ -152,7 +155,10 @@ identical; conflicting or out-of-order data fails.
 Call `artifact_upload_commit` after all bytes have been uploaded. DevSpace
 validates the declared size and digest, computes SHA-256 server-side, atomically
 promotes the partial file into immutable content-addressed storage, and creates
-a private presentation copy with the sanitized original filename.
+a private presentation copy with the sanitized original filename. The same
+transaction stores an owner-scoped upload-to-artifact receipt for one hour. If
+the first response is lost, retrying the same upload ID returns the original
+artifact record and SHA-256 instead of a false `upload not found` result.
 
 A committed or inspected artifact result includes:
 
@@ -294,15 +300,13 @@ The exchange enforces:
   tokens, or tokenized URLs.
 
 The MIME type is only a hint. DevSpace does not inspect archives, execute
-content, fetch arbitrary URLs, serve an unauthenticated download route, widen
-workspace roots, automatically publish artifacts, or treat the exchange as
-permanent storage.
+content, fetch arbitrary URLs outside the validated ChatGPT file boundary,
+serve an unauthenticated download route, widen workspace roots, automatically
+publish artifacts, or treat the exchange as permanent storage.
 
 ## Current Non-Goals
 
-This implementation does not include a validated production host-specific
-native file adapter, archive handling, malware scanning, automatic project
-copying, or permanent storage. The `stage_artifact` boundary and probe harness
-do not claim connector compatibility by themselves. Those capabilities require
-separate design and testing rather than expanding this transfer seam
-implicitly.
+This implementation does not include adapters for other MCP hosts, archive
+handling, malware scanning, automatic project copying, or permanent storage.
+Those capabilities require separate design and testing rather than expanding
+the reviewed ChatGPT transfer seam implicitly.
