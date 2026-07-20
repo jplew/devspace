@@ -131,8 +131,8 @@ async function testOpenAIFileAdapter(testRoot: string): Promise<void> {
   assert.deepEqual(await collect(opened.stream), bytes);
 
   const generatedReference = {
-    download_url: "https://files.oaiusercontent.com/file_00000000383081fdb6463fc91842fb43/download?sig=secret",
-    file_id: "file_00000000383081fdb6463fc91842fb43",
+    download_url: "https://oaisdmntprcentralus.blob.core.windows.net/chatgpt-file/generated-image.png?sig=secret",
+    file_id: "file-service://generated+opaque/abc123",
     mime_type: null,
     file_name: null,
     name: "/mnt/data/generated-image.png",
@@ -185,7 +185,7 @@ async function testOpenAIFileAdapter(testRoot: string): Promise<void> {
     file_name: null,
     name: null,
   });
-  assert.equal(fallbackOpened.name, `${generatedReference.file_id}.png`);
+  assert.equal(fallbackOpened.name, "chatgpt-file.png");
   fallbackOpened.stream.destroy();
 
   await expectArtifactError(
@@ -214,6 +214,13 @@ async function testOpenAIFileAdapter(testRoot: string): Promise<void> {
   await expectArtifactError(
     registry.open({
       ...reference,
+      download_url: "https://attacker.blob.core.windows.net/private.png",
+    }),
+    "unsafe_openai_file_reference",
+  );
+  await expectArtifactError(
+    registry.open({
+      ...reference,
       download_url: "http://files.oaiusercontent.com/file_123",
     }),
     "unsafe_openai_file_reference",
@@ -221,7 +228,14 @@ async function testOpenAIFileAdapter(testRoot: string): Promise<void> {
   await expectArtifactError(
     registry.open({
       ...reference,
-      file_id: "not-a-file-id",
+      file_id: "file_\u0000secret",
+    }),
+    "invalid_openai_file_reference",
+  );
+  await expectArtifactError(
+    registry.open({
+      ...reference,
+      file_id: "x".repeat(513),
     }),
     "invalid_openai_file_reference",
   );
@@ -455,7 +469,7 @@ async function testFailedStageCleanup(testRoot: string): Promise<void> {
 function testStageLogRedaction(): void {
   const secret = "https://files.example.test/download?token=super-secret";
   const fields = artifactToolLogFields("stage_artifact", {
-    file: { href: secret, bearer: "Bearer secret" },
+    file: { download_url: secret, href: secret, bearer: "Bearer secret" },
     workspaceId: "ws_123",
     expectedSha256: "f".repeat(64),
     ttlHours: 24,
@@ -471,10 +485,12 @@ function testStageLogRedaction(): void {
     constructor: "Object",
     entries: {
       bearer: { type: "string", kind: "text", length: 13 },
+      download_url: { type: "string", kind: "url", length: secret.length },
       href: { type: "string", kind: "url", length: secret.length },
     },
     truncated: false,
   });
+  assert.equal(fields.downloadUrlHostname, "files.example.test");
   assert.equal(fields.expectedSha256Present, true);
 }
 
