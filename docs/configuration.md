@@ -39,6 +39,36 @@ npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
 | `DEVSPACE_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.devspace/worktrees`. |
 | `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
 
+## Native Artifact Staging
+
+Private native-file staging is disabled by default. Enable it when ChatGPT needs
+to hand an attached or generated file to commands running on the DevSpace host:
+
+```bash
+DEVSPACE_ARTIFACTS=1 npx @waishnav/devspace serve
+```
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DEVSPACE_ARTIFACTS` | `0` | Expose `stage_artifact`, `artifact_stat`, and `artifact_delete`. |
+| `DEVSPACE_ARTIFACT_ROOT` | `~/.local/share/devspace/artifacts` | Private storage root outside repositories and worktrees. |
+| `DEVSPACE_ARTIFACT_MAX_FILE_BYTES` | `104857600` | Maximum decoded size of one artifact (100 MiB). |
+| `DEVSPACE_ARTIFACT_MAX_TOTAL_BYTES` | `1073741824` | Maximum combined stored-object and in-progress bytes (1 GiB). |
+| `DEVSPACE_ARTIFACT_TTL_HOURS` | `24` | Default lifetime of an unpinned staged artifact. |
+
+The same settings may be persisted in `~/.devspace/config.json` as
+`artifactsEnabled`, `artifactRoot`, `artifactMaxFileBytes`,
+`artifactMaxTotalBytes`, and `artifactDefaultTtlHours`.
+
+`stage_artifact` accepts only the native file object supplied by the ChatGPT
+connector. It does not accept arbitrary URL strings, paths, embedded credentials,
+or extra object fields. Files are streamed through bounded private storage and
+never copied into a workspace or repository. Cleanup runs at startup and
+periodically, with a bounded number of records processed per pass.
+
+See [Native Artifact Staging](artifact-exchange.md) for the supported connector
+shape and security boundaries.
+
 ## OAuth
 
 DevSpace uses a single-user OAuth approval flow.
@@ -158,6 +188,7 @@ DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)" \
 DEVSPACE_ALLOWED_ROOTS="$HOME/personal,$HOME/work" \
 DEVSPACE_PUBLIC_BASE_URL="https://devspace.example.com" \
 DEVSPACE_WORKTREE_ROOT="$HOME/.devspace/worktrees" \
+DEVSPACE_ARTIFACTS="1" \
 DEVSPACE_TOOL_MODE="minimal" \
 DEVSPACE_WIDGETS="full" \
 npx @waishnav/devspace serve

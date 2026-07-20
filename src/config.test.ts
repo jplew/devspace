@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "./config.js";
+import { loadConfig, MAX_ARTIFACT_TTL_HOURS } from "./config.js";
 import { ensureDevspaceDefaultSkills, resolveSubagentsFlag } from "./user-config.js";
 
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "devspace-empty-config-test-"));
@@ -26,6 +26,31 @@ assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.equal(loadConfig(baseEnv).devspaceSkillsDir, join(emptyConfigDir, "skills"));
 assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents"));
 assert.equal(loadConfig(baseEnv).subagents, false);
+assert.equal(loadConfig(baseEnv).artifactsEnabled, false);
+assert.equal(
+  loadConfig(baseEnv).artifactRoot,
+  join(homedir(), ".local", "share", "devspace", "artifacts"),
+);
+assert.equal(loadConfig(baseEnv).artifactMaxFileBytes, 100 * 1024 * 1024);
+assert.equal(loadConfig(baseEnv).artifactMaxTotalBytes, 1024 * 1024 * 1024);
+assert.equal(loadConfig(baseEnv).artifactDefaultTtlHours, 24);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_ARTIFACTS: "1" }).artifactsEnabled, true);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_ROOT: "~/private-artifacts" }).artifactRoot,
+  join(homedir(), "private-artifacts"),
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_MAX_FILE_BYTES: "123" }).artifactMaxFileBytes,
+  123,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_MAX_TOTAL_BYTES: "456" }).artifactMaxTotalBytes,
+  456,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_TTL_HOURS: "48" }).artifactDefaultTtlHours,
+  48,
+);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);
 assert.equal(
@@ -138,6 +163,25 @@ assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS: "0" }),
   /Invalid DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS: 0/,
 );
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_MAX_FILE_BYTES: "0" }),
+  /Invalid DEVSPACE_ARTIFACT_MAX_FILE_BYTES: 0/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_MAX_TOTAL_BYTES: "nope" }),
+  /Invalid DEVSPACE_ARTIFACT_MAX_TOTAL_BYTES: nope/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_TTL_HOURS: "-1" }),
+  /Invalid DEVSPACE_ARTIFACT_TTL_HOURS: -1/,
+);
+assert.throws(
+  () => loadConfig({
+    ...baseEnv,
+    DEVSPACE_ARTIFACT_TTL_HOURS: String(MAX_ARTIFACT_TTL_HOURS + 1),
+  }),
+  /Invalid DEVSPACE_ARTIFACT_TTL_HOURS/,
+);
 
 assert.equal(loadConfig(baseEnv).publicBaseUrl, "http://127.0.0.1:7676");
 assert.deepEqual(loadConfig(baseEnv).allowedHosts, ["localhost", "127.0.0.1", "::1"]);
@@ -163,6 +207,11 @@ writeFileSync(
     allowedRoots: [process.cwd()],
     publicBaseUrl: "https://devspace.example.com",
     subagents: true,
+    artifactsEnabled: true,
+    artifactRoot: join(configDir, "persisted-artifacts"),
+    artifactMaxFileBytes: 321,
+    artifactMaxTotalBytes: 654,
+    artifactDefaultTtlHours: 72,
   }),
 );
 writeFileSync(
@@ -177,6 +226,11 @@ assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
 assert.equal(fileConfig.subagents, true);
+assert.equal(fileConfig.artifactsEnabled, true);
+assert.equal(fileConfig.artifactRoot, join(configDir, "persisted-artifacts"));
+assert.equal(fileConfig.artifactMaxFileBytes, 321);
+assert.equal(fileConfig.artifactMaxTotalBytes, 654);
+assert.equal(fileConfig.artifactDefaultTtlHours, 72);
 assert.deepEqual(fileConfig.allowedHosts, [
   "localhost",
   "127.0.0.1",
