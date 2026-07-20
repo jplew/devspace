@@ -69,6 +69,14 @@ function testChatGPTFileDescriptor(): void {
     file_name: "generated.png",
   };
   assert.deepEqual(fileSchema.parse(valid), valid);
+  const generated = {
+    ...valid,
+    mime_type: null,
+    file_name: null,
+    name: "/mnt/data/generated.png",
+    size: 123,
+  };
+  assert.deepEqual(fileSchema.parse(generated), generated);
   assert.throws(() => fileSchema.parse({ file_id: "file_123" }));
   assert.throws(() => fileSchema.parse({
     ...valid,
@@ -86,6 +94,8 @@ function testChatGPTFileDescriptor(): void {
     "file_id",
     "file_name",
     "mime_type",
+    "name",
+    "size",
   ]);
   assert.deepEqual([...(jsonSchema.required ?? [])].sort(), ["download_url", "file_id"]);
 }
@@ -120,6 +130,21 @@ async function testOpenAIFileAdapter(testRoot: string): Promise<void> {
   assert.equal(opened.size, bytes.length);
   assert.deepEqual(await collect(opened.stream), bytes);
 
+  const generatedReference = {
+    download_url: "https://files.oaiusercontent.com/file_00000000383081fdb6463fc91842fb43/download?sig=secret",
+    file_id: "file_00000000383081fdb6463fc91842fb43",
+    mime_type: null,
+    file_name: null,
+    name: "/mnt/data/generated-image.png",
+    size: bytes.length,
+  };
+  const generatedOpened = await registry.open(generatedReference);
+  assert.equal(generatedOpened.adapterId, "openai-file");
+  assert.equal(generatedOpened.name, "generated-image.png");
+  assert.equal(generatedOpened.mimeType, "image/png");
+  assert.equal(generatedOpened.size, bytes.length);
+  assert.deepEqual(await collect(generatedOpened.stream), bytes);
+
   const store = createStore(testRoot);
   try {
     const staged = await stageIncomingArtifact({
@@ -135,10 +160,49 @@ async function testOpenAIFileAdapter(testRoot: string): Promise<void> {
       (await store.statArtifact("client-a", staged.artifactId)).source,
       "incoming:openai-file",
     );
+
+    const generatedStaged = await stageIncomingArtifact({
+      store,
+      clientId: "client-a",
+      registry,
+      input: { file: generatedReference },
+    });
+    assert.equal(generatedStaged.name, "generated-image.png");
+    assert.equal(generatedStaged.mimeType, "image/png");
+    assert.deepEqual(await readFile(generatedStaged.hostPath), bytes);
   } finally {
     store.close();
   }
-  assert.deepEqual(requested, [reference.download_url, reference.download_url]);
+  assert.deepEqual(requested, [
+    reference.download_url,
+    generatedReference.download_url,
+    reference.download_url,
+    generatedReference.download_url,
+  ]);
+
+  const fallbackOpened = await registry.open({
+    ...generatedReference,
+    file_name: null,
+    name: null,
+  });
+  assert.equal(fallbackOpened.name, `${generatedReference.file_id}.png`);
+  fallbackOpened.stream.destroy();
+
+  await expectArtifactError(
+    registry.open({
+      ...generatedReference,
+      file_name: "first.png",
+      name: "second.png",
+    }),
+    "ambiguous_openai_file_name",
+  );
+  await expectArtifactError(
+    registry.open({
+      ...generatedReference,
+      size: bytes.length + 1,
+    }),
+    "openai_file_size_mismatch",
+  );
 
   await expectArtifactError(
     registry.open({
@@ -402,6 +466,15 @@ function testStageLogRedaction(): void {
   assert.equal(serialized.includes(secret), false);
   assert.equal(serialized.includes("Bearer secret"), false);
   assert.equal(fields.fileProvided, true);
+  assert.deepEqual(fields.fileReferenceShape, {
+    type: "object",
+    constructor: "Object",
+    entries: {
+      bearer: { type: "string", kind: "text", length: 13 },
+      href: { type: "string", kind: "url", length: secret.length },
+    },
+    truncated: false,
+  });
   assert.equal(fields.expectedSha256Present, true);
 }
 

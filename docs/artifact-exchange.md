@@ -33,7 +33,9 @@ field before invoking DevSpace:
     "download_url": "https://files.oaiusercontent.com/...",
     "file_id": "file_...",
     "mime_type": "image/png",
-    "file_name": "generated.png"
+    "file_name": "generated.png",
+    "name": "/mnt/data/generated.png",
+    "size": 123456
   },
   "workspaceId": "optional association only",
   "expectedSha256": "sha256:...",
@@ -42,12 +44,19 @@ field before invoking DevSpace:
 }
 ```
 
-The production OpenAI adapter accepts only the documented file object shape.
-`download_url` and `file_id` are required; `mime_type` and `file_name` are
-optional. Download URLs must use HTTPS on `files.oaiusercontent.com`, redirects
-are revalidated before they are followed, and arbitrary URLs, paths, extra
-credential fields, and malformed IDs fail closed. A workspace ID is metadata
-only and never a write destination.
+The production OpenAI adapter requires `download_url` and `file_id`. It accepts
+the documented `mime_type` and `file_name` fields plus the connector compatibility
+aliases `name` and `size`. Optional metadata may be omitted or `null`, which is
+important for generated-image results. A sandbox-style filename such as
+`/mnt/data/generated.png` is reduced to its safe basename; when no filename is
+available, DevSpace derives an extension from the MIME type. If both filename
+fields are present they must resolve to the same basename, and a supplied byte
+size must agree with the response `Content-Length` when both are available.
+
+Download URLs must use HTTPS on `files.oaiusercontent.com`, redirects are
+revalidated before they are followed, and arbitrary URLs, unresolved path
+strings, extra credential fields, malformed IDs, and conflicting metadata fail
+closed. A workspace ID is metadata only and never a write destination.
 
 A successful stage streams through the same byte limits, total quota,
 server-side SHA-256, private partial-file, and atomic content-addressed commit
@@ -114,6 +123,9 @@ fails staging with `incoming_artifact_probe_captured`; the raw value is never
 put in tool results or logs. The redacted shape preserves ordinary structural
 keys and value classes while omitting string contents; unusual or long keys are
 replaced with placeholders so tokens and presigned URLs are not persisted.
+`stage_artifact` lifecycle logs include this same redacted shape summary, making
+connector regressions diagnosable without recording filenames, file IDs,
+signed URLs, or bearer material.
 
 The probe remains available for future MCP hosts with different file contracts.
 It is not registered by the production server and must not be used as a generic

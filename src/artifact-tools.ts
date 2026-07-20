@@ -15,6 +15,7 @@ import {
   type ArtifactStore,
 } from "./artifacts.js";
 import {
+  describeIncomingArtifactValue,
   IncomingArtifactAdapterRegistry,
   type IncomingArtifactAdapter,
 } from "./incoming-artifacts.js";
@@ -33,8 +34,10 @@ const ARTIFACT_WRITE_ANNOTATIONS = {
 const openAIFileReferenceInputSchema = z.object({
   download_url: z.string(),
   file_id: z.string(),
-  mime_type: z.string().optional(),
-  file_name: z.string().optional(),
+  mime_type: z.string().nullable().optional(),
+  file_name: z.string().nullable().optional(),
+  name: z.string().nullable().optional(),
+  size: z.number().int().nonnegative().nullable().optional(),
 });
 
 const artifactRecordOutputSchema = {
@@ -466,6 +469,7 @@ export function artifactToolLogFields(
     case "stage_artifact":
       return {
         fileProvided: input.file !== undefined,
+        fileReferenceShape: describeIncomingArtifactValue(input.file),
         workspaceId: input.workspaceId,
         expectedSha256Present: typeof input.expectedSha256 === "string",
         ttlHours: input.ttlHours,

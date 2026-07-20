@@ -158,10 +158,12 @@ disabled unless `DEVSPACE_LOG_SHELL_COMMANDS=1`.
 Do not enable shell command logging if commands may contain secrets.
 
 Artifact tool logs contain identifiers, names, MIME hints, byte counts, hashes,
-workspace paths, conflict modes, and status fields. `stage_artifact` logs only
-whether a file value and expected digest were supplied plus non-sensitive
-options; it does not log the opaque file value. Raw content, connector
-references, base64 chunks, bearer credentials, authorization headers,
-presigned URLs, and protected download URLs are never included in tool logs.
+workspace paths, conflict modes, and status fields. `stage_artifact` logs whether
+a file value and expected digest were supplied, non-sensitive options, and a
+redacted structural summary of the file value. That summary records bounded key
+names plus value types/classes and string lengths, but never string contents.
+Raw content, connector file IDs, filenames, path values, base64 chunks, bearer
+credentials, authorization headers, presigned URLs, and protected download URLs
+are never included in tool logs.
 Tool results may include a tokenless protected resource URL that still requires
 the caller's bearer authorization.
