@@ -14,6 +14,8 @@ const OPENAI_FILE_KEYS = new Set([
   "file_id",
   "mime_type",
   "file_name",
+  "name",
+  "size",
 ]);
 const OPENAI_FILE_REDIRECT_LIMIT = 3;
 const OPENAI_FILE_DOWNLOAD_TIMEOUT_MS = 30_000;
@@ -119,6 +121,7 @@ export interface OpenAIFileReference {
   file_id: string;
   mime_type?: string;
   file_name?: string;
+  size?: number;
 }
 
 export interface OpenAIIncomingArtifactAdapterOptions {
@@ -142,14 +145,9 @@ export function createOpenAIIncomingArtifactAdapter(
     id: "openai-file",
     canHandle: isOpenAIFileReferenceCandidate,
     async open(value: unknown): Promise<IncomingArtifactSource> {
-      if (!isOpenAIFileReference(value)) {
-        throw new ArtifactError(
-          "invalid_openai_file_reference",
-          "ChatGPT file reference is malformed.",
-        );
-      }
+      const reference = normalizeOpenAIFileReference(value);
 
-      let downloadUrl = validateOpenAIFileUrl(value.download_url);
+      let downloadUrl = validateOpenAIFileUrl(reference.download_url);
       let response: Response | undefined;
       for (let redirect = 0; redirect <= OPENAI_FILE_REDIRECT_LIMIT; redirect += 1) {
         try {
@@ -184,10 +182,24 @@ export function createOpenAIIncomingArtifactAdapter(
         );
       }
 
+      const responseSize = responseContentLength(response);
+      if (
+        reference.size !== undefined
+        && responseSize !== undefined
+        && reference.size !== responseSize
+      ) {
+        await response.body.cancel().catch(() => undefined);
+        throw new ArtifactError(
+          "openai_file_size_mismatch",
+          "ChatGPT file metadata did not match the downloaded content.",
+        );
+      }
+      const mimeType = reference.mime_type ?? responseMimeType(response);
+
       return {
-        name: value.file_name ?? `${value.file_id}.bin`,
-        mimeType: value.mime_type ?? responseMimeType(response),
-        size: responseContentLength(response),
+        name: normalizeOpenAIFileName(reference.file_name, reference.file_id, mimeType),
+        mimeType,
+        size: responseSize ?? reference.size,
         stream: Readable.fromWeb(response.body as unknown as NodeReadableStream),
       };
     },
@@ -405,7 +417,7 @@ function validateIncomingArtifactSource(source: IncomingArtifactSource): void {
   }
 }
 
-function isOpenAIFileReferenceCandidate(value: unknown): boolean {
+function isOpenAIFileReferenceCandidate(value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) return false;
   const keys = Object.keys(value);
   return keys.length >= 2
@@ -414,19 +426,105 @@ function isOpenAIFileReferenceCandidate(value: unknown): boolean {
     && Object.hasOwn(value, "file_id");
 }
 
-function isOpenAIFileReference(value: unknown): value is OpenAIFileReference {
-  return isOpenAIFileReferenceCandidate(value)
-    && typeof (value as Record<string, unknown>).download_url === "string"
-    && typeof (value as Record<string, unknown>).file_id === "string"
-    && OPENAI_FILE_ID_PATTERN.test((value as Record<string, string>).file_id)
-    && (
-      (value as Record<string, unknown>).mime_type === undefined
-      || typeof (value as Record<string, unknown>).mime_type === "string"
-    )
-    && (
-      (value as Record<string, unknown>).file_name === undefined
-      || typeof (value as Record<string, unknown>).file_name === "string"
+function normalizeOpenAIFileReference(value: unknown): OpenAIFileReference {
+  if (!isOpenAIFileReferenceCandidate(value)) {
+    throw new ArtifactError(
+      "invalid_openai_file_reference",
+      "ChatGPT file reference is malformed.",
     );
+  }
+
+  const downloadUrl = value.download_url;
+  const fileId = value.file_id;
+  if (
+    typeof downloadUrl !== "string"
+    || typeof fileId !== "string"
+    || !OPENAI_FILE_ID_PATTERN.test(fileId)
+  ) {
+    throw new ArtifactError(
+      "invalid_openai_file_reference",
+      "ChatGPT file reference is malformed.",
+    );
+  }
+
+  const mimeType = nullableString(value.mime_type);
+  const fileName = nullableString(value.file_name);
+  const nameAlias = nullableString(value.name);
+  if (mimeType === null || fileName === null || nameAlias === null) {
+    throw new ArtifactError(
+      "invalid_openai_file_reference",
+      "ChatGPT file reference is malformed.",
+    );
+  }
+  const normalizedFileName = normalizeSuppliedOpenAIFileName(fileName);
+  const normalizedNameAlias = normalizeSuppliedOpenAIFileName(nameAlias);
+  if (
+    normalizedFileName
+    && normalizedNameAlias
+    && normalizedFileName !== normalizedNameAlias
+  ) {
+    throw new ArtifactError(
+      "ambiguous_openai_file_name",
+      "ChatGPT file reference contained conflicting filenames.",
+    );
+  }
+
+  let size: number | undefined;
+  const rawSize = value.size;
+  if (rawSize !== undefined && rawSize !== null) {
+    if (typeof rawSize !== "number" || !Number.isSafeInteger(rawSize) || rawSize < 0) {
+      throw new ArtifactError(
+        "invalid_openai_file_reference",
+        "ChatGPT file reference is malformed.",
+      );
+    }
+    size = rawSize;
+  }
+
+  return {
+    download_url: downloadUrl,
+    file_id: fileId,
+    mime_type: mimeType,
+    file_name: normalizedFileName ?? normalizedNameAlias,
+    size,
+  };
+}
+
+function nullableString(value: unknown): string | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  return typeof value === "string" ? value : null;
+}
+
+function normalizeOpenAIFileName(
+  suppliedName: string | undefined,
+  fileId: string,
+  mimeType: string | undefined,
+): string {
+  return suppliedName ?? `${fileId}${extensionForMimeType(mimeType) ?? ".bin"}`;
+}
+
+function normalizeSuppliedOpenAIFileName(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.replaceAll("\\", "/");
+  const candidate = basename(normalized).trim();
+  if (!candidate || candidate === "." || candidate === ".." || candidate.startsWith(".")) {
+    return undefined;
+  }
+  return candidate;
+}
+
+function extensionForMimeType(mimeType: string | undefined): string | undefined {
+  switch (mimeType?.toLowerCase()) {
+    case "image/png": return ".png";
+    case "image/jpeg": return ".jpg";
+    case "image/webp": return ".webp";
+    case "image/gif": return ".gif";
+    case "application/pdf": return ".pdf";
+    case "text/plain": return ".txt";
+    case "application/zip": return ".zip";
+    case "application/vnd.openxmlformats-officedocument.wordprocessingml.document": return ".docx";
+    default: return undefined;
+  }
 }
 
 function validateOpenAIFileUrl(value: string): string {
