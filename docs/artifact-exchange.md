@@ -53,10 +53,13 @@ available, DevSpace derives an extension from the MIME type. If both filename
 fields are present they must resolve to the same basename, and a supplied byte
 size must agree with the response `Content-Length` when both are available.
 
-Download URLs must use HTTPS on `files.oaiusercontent.com`, redirects are
-revalidated before they are followed, and arbitrary URLs, unresolved path
-strings, extra credential fields, malformed IDs, and conflicting metadata fail
-closed. A workspace ID is metadata only and never a write destination.
+Download URLs must use HTTPS on an exact trusted host. DevSpace accepts
+`files.oaiusercontent.com` for ordinary files and the observed
+`oaisdmntprcentralus.blob.core.windows.net` storage account used by generated
+ChatGPT images. Redirects are revalidated before they are followed, and arbitrary
+URLs, other Azure Blob accounts, unresolved path strings, extra credential
+fields, malformed IDs, and conflicting metadata fail closed. A workspace ID is
+metadata only and never a write destination.
 
 A successful stage streams through the same byte limits, total quota,
 server-side SHA-256, private partial-file, and atomic content-addressed commit

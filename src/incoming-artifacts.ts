@@ -7,8 +7,13 @@ import { ArtifactError } from "./artifacts.js";
 
 const LOCAL_FIXTURE_KIND = "devspace-local-fixture-v1";
 const ADAPTER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
-const OPENAI_FILE_HOST = "files.oaiusercontent.com";
-const OPENAI_FILE_ID_PATTERN = /^file[-_][A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u;
+const OPENAI_FILE_HOSTS = new Set([
+  "files.oaiusercontent.com",
+  "oaisdmntprcentralus.blob.core.windows.net",
+]);
+const OPENAI_FILENAME_SAFE_FILE_ID_PATTERN = /^file[-_][A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u;
+const OPENAI_FILE_ID_MAX_LENGTH = 512;
+const OPENAI_FILE_ID_CONTROL_PATTERN = /[\u0000-\u001F\u007F]/u;
 const OPENAI_FILE_KEYS = new Set([
   "download_url",
   "file_id",
@@ -439,7 +444,7 @@ function normalizeOpenAIFileReference(value: unknown): OpenAIFileReference {
   if (
     typeof downloadUrl !== "string"
     || typeof fileId !== "string"
-    || !OPENAI_FILE_ID_PATTERN.test(fileId)
+    || !isValidOpenAIFileId(fileId)
   ) {
     throw new ArtifactError(
       "invalid_openai_file_reference",
@@ -500,7 +505,17 @@ function normalizeOpenAIFileName(
   fileId: string,
   mimeType: string | undefined,
 ): string {
-  return suppliedName ?? `${fileId}${extensionForMimeType(mimeType) ?? ".bin"}`;
+  if (suppliedName) return suppliedName;
+  const safeBaseName = OPENAI_FILENAME_SAFE_FILE_ID_PATTERN.test(fileId)
+    ? fileId
+    : "chatgpt-file";
+  return `${safeBaseName}${extensionForMimeType(mimeType) ?? ".bin"}`;
+}
+
+function isValidOpenAIFileId(value: string): boolean {
+  return value.length > 0
+    && value.length <= OPENAI_FILE_ID_MAX_LENGTH
+    && !OPENAI_FILE_ID_CONTROL_PATTERN.test(value);
 }
 
 function normalizeSuppliedOpenAIFileName(value: string | undefined): string | undefined {
@@ -539,7 +554,7 @@ function validateOpenAIFileUrl(value: string): string {
   }
   if (
     url.protocol !== "https:"
-    || url.hostname !== OPENAI_FILE_HOST
+    || !OPENAI_FILE_HOSTS.has(url.hostname)
     || (url.port !== "" && url.port !== "443")
     || url.username !== ""
     || url.password !== ""

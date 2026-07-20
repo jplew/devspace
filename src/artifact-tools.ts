@@ -449,6 +449,18 @@ export async function stageIncomingArtifact({
   }
 }
 
+function incomingFileDownloadHostname(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const rawUrl = (value as Record<string, unknown>).download_url;
+  if (typeof rawUrl !== "string") return undefined;
+  try {
+    const hostname = new URL(rawUrl).hostname.toLowerCase();
+    return hostname.length > 0 && hostname.length <= 253 ? hostname : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function incomingStreamChunk(value: unknown): Buffer {
   if (Buffer.isBuffer(value)) return value;
   if (typeof value === "string") return Buffer.from(value);
@@ -470,6 +482,7 @@ export function artifactToolLogFields(
       return {
         fileProvided: input.file !== undefined,
         fileReferenceShape: describeIncomingArtifactValue(input.file),
+        downloadUrlHostname: incomingFileDownloadHostname(input.file),
         workspaceId: input.workspaceId,
         expectedSha256Present: typeof input.expectedSha256 === "string",
         ttlHours: input.ttlHours,
