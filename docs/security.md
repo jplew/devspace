@@ -92,54 +92,51 @@ Managed worktrees reduce accidental edits to your active checkout, but they are
 not a security boundary. They are a workflow boundary for isolated coding
 sessions.
 
-## Artifact Exchange
+## Native File Download
 
-The Artifact Exchange is an opt-in private byte-transfer seam. Its root is
-separate from allowed workspace roots, repositories, worktrees, temporary
-folders, and public static assets.
+Native file download is an opt-in, one-shot byte-transfer seam. It has no
+persistent artifact root, object database, upload lifecycle, reusable artifact
+ID, public download route, TTL, pinning, or quota ledger.
 
-DevSpace selects every storage path. Artifact names are metadata, not path
-components. Names are Unicode-normalized and must be a single non-hidden
-basename without separators, NUL bytes, or control characters. The store uses
-content-addressed immutable objects, mode `0700` directories, mode `0600`
-object and partial files, atomic promotion, realpath containment checks,
-regular-file enforcement, and no-follow file opens where the platform supports
-them.
+The production server declares ChatGPT's top-level `openai/fileParams` contract
+and accepts only the documented `download_url`, `file_id`, optional
+MIME/filename aliases, and optional size. Downloads use HTTPS on
+`files.oaiusercontent.com` or the constrained regional OpenAI Azure account
+family `oaisdmntpr<region>.blob.core.windows.net`, where `<region>` is lowercase
+alphanumeric. Arbitrary Azure Blob accounts, alternate ports, credentials,
+fragments, malformed IDs, extra fields, and redirects outside that boundary fail
+closed. Opaque IDs are bounded metadata and are never used as filenames or path
+components.
 
-Artifact records are scoped to the authenticated OAuth client. The first
-version remains under the existing owner-only `devspace` scope. It does not add
-an unauthenticated download route or expose the artifact root with
-`express.static`.
+`download_artifact` accepts only the native file value plus a `workspaceId`
+returned by `open_workspace`. DevSpace chooses a normalized, collision-free path
+below `.devspace/incoming/`; callers cannot supply a destination, conflict mode,
+expected hash, host path, or storage policy.
 
-Native staging is adapter-gated. The production server declares ChatGPT's
-top-level `openai/fileParams` contract and accepts only the documented
-`download_url`, `file_id`, optional MIME/filename aliases, and optional size.
-Downloads use HTTPS on `files.oaiusercontent.com` or the constrained regional
-OpenAI Azure account family
-`oaisdmntpr<region>.blob.core.windows.net`, where `<region>` is lowercase
-alphanumeric. This permits observed OpenAI regional accounts such as
-`centralus`, `westcentralus`, and `centralindia`, but not arbitrary Azure Blob
-accounts. Credentials, fragments, alternate ports, malformed IDs, extra fields,
-and redirects outside that boundary fail closed. Opaque IDs are bounded metadata
-and are never used as filenames or path components.
+The selected workspace is opened without following symlinks. DevSpace then
+creates or opens `.devspace` and `incoming` through already-open parent directory
+descriptors, and keeps partial creation, cleanup, and final publication anchored
+to the open `incoming` descriptor. Replacing a pathname therefore cannot redirect
+writes outside the selected workspace. Symlinked components, non-directories,
+and group/world-writable incoming directories fail closed. Existing directories
+are inspected but are never chmodded as a startup side effect.
 
-The native materialization seam deliberately does not:
+Bytes stream into an exclusive mode-`0600` partial under the configured per-file
+limit. DevSpace computes SHA-256 while writing, verifies any size hint, chmods
+and fsyncs through the still-open descriptor, then publishes the verified inode
+with an atomic hard link. It does not path-chmod or path-hash the published file.
+Partials are removed on success or failure; crash-leftover cleanup is bounded and
+only considers owned, regular DevSpace partial files.
 
-- fetch arbitrary URLs
-- expose a generic upload API
-- expose persistent artifact IDs or a user-facing artifact library
-- extract archives
-- execute transferred content
-- expand workspace allowlists
-- preserve executable permissions
-- publish or permanently retain content
+The native download seam deliberately does not:
 
-`materialize_artifact` is the explicit, bounded write path: it accepts only a
-native MCP-host file value and writes only within an already-open allowed
-workspace. It requires a relative destination and explicit conflict mode,
-creates only real contained parent directories, rejects symlink/non-regular-file
-paths, and verifies the final size and SHA-256. Any private staging is server
-implementation detail and is cleaned up automatically.
+- fetch arbitrary URLs or local paths;
+- expose generic upload/chunk/stat/delete/copy tools;
+- expose artifact IDs, signed URLs, host paths, temp paths, or raw content;
+- extract archives or execute transferred content;
+- expand workspace allowlists;
+- preserve executable permissions;
+- opportunistically delete legacy artifact tables or bytes.
 
 ## Logs
 
@@ -148,7 +145,9 @@ disabled unless `DEVSPACE_LOG_SHELL_COMMANDS=1`.
 
 Do not enable shell command logging if commands may contain secrets.
 
-Artifact tool logs contain bounded workspace, destination, conflict-mode,
-hostname, byte-count, hash, and status metadata. `materialize_artifact` does not
-log the opaque file value. Raw content, connector references, bearer credentials,
-presigned URLs, and base64 chunks are never included in tool logs or tool results.
+Artifact tool logs contain bounded workspace ID, validated hostname,
+workspace-relative output path, byte count, hash, duration, and status metadata.
+`download_artifact` does not log the opaque file value. Raw content, connector
+references, native file IDs, bearer credentials, presigned URLs, host paths,
+temporary paths, and base64 chunks are never included in tool logs or tool
+results.

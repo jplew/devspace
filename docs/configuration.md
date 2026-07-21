@@ -39,10 +39,10 @@ npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
 | `DEVSPACE_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.devspace/worktrees`. |
 | `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
 
-## Native Artifact Staging
+## Native Artifact Download
 
-Private native-file staging is disabled by default. Enable it when ChatGPT needs
-to hand an attached or generated file to commands running on the DevSpace host:
+Native-file download is disabled by default. Enable it when ChatGPT needs to hand
+an attached or generated file into an already-open workspace:
 
 ```bash
 DEVSPACE_ARTIFACTS=1 npx @waishnav/devspace serve
@@ -50,25 +50,22 @@ DEVSPACE_ARTIFACTS=1 npx @waishnav/devspace serve
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DEVSPACE_ARTIFACTS` | `0` | Expose `materialize_artifact` for trusted native files. |
-| `DEVSPACE_ARTIFACT_ROOT` | `~/.local/share/devspace/artifacts` | Private storage root outside repositories and worktrees. |
-| `DEVSPACE_ARTIFACT_MAX_FILE_BYTES` | `104857600` | Maximum decoded size of one artifact (100 MiB). |
-| `DEVSPACE_ARTIFACT_MAX_TOTAL_BYTES` | `1073741824` | Maximum combined stored-object and in-progress bytes (1 GiB). |
-| `DEVSPACE_ARTIFACT_TTL_HOURS` | `24` | Default lifetime of an unpinned staged artifact. |
+| `DEVSPACE_ARTIFACTS` | `0` | Expose `download_artifact` for trusted native files. |
+| `DEVSPACE_ARTIFACT_MAX_FILE_BYTES` | `104857600` | Maximum streamed size of one file (100 MiB). |
 
 The same settings may be persisted in `~/.devspace/config.json` as
-`artifactsEnabled`, `artifactRoot`, `artifactMaxFileBytes`,
-`artifactMaxTotalBytes`, and `artifactDefaultTtlHours`.
+`artifactsEnabled` and `artifactMaxFileBytes`.
 
-`materialize_artifact` accepts only the native file object supplied by the MCP
-connector and writes it to a relative destination inside an already-open workspace.
-It does not accept arbitrary URL strings, paths, embedded credentials, or extra
-object fields. Files are streamed through bounded private storage, then verified
-and automatically cleaned up after materialization. Startup and periodic cleanup
-also process stale internal state with bounded work per pass.
+`download_artifact` accepts only the native file object supplied by the MCP
+connector plus a `workspaceId` returned by `open_workspace`. DevSpace chooses a
+collision-free path under `.devspace/incoming/` and returns only that
+workspace-relative path. It does not accept destinations, conflict modes,
+expected hashes, arbitrary URL strings, local paths, embedded credentials, or
+extra object fields.
 
-See [Native Artifact Staging](artifact-exchange.md) for the supported connector
-shape and security boundaries.
+There is no artifact root, total quota, TTL, pinning, persistent database record,
+or background artifact cleanup service. See [Native File Download](artifact-exchange.md)
+for the supported connector shape and security boundaries.
 
 ## OAuth
 

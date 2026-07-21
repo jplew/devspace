@@ -24,8 +24,11 @@ const migrations: Migration[] = [
   },
   {
     version: 4,
-    name: "artifact-exchange",
-    up: migrateArtifactExchange,
+    name: "artifact-exchange-retired",
+    // Preserve the historical migration version without creating new
+    // persistent artifact tables. Existing user tables and bytes are left
+    // untouched; the one-shot download path does not read or mutate them.
+    up: () => undefined,
   },
 ];
 
@@ -177,64 +180,6 @@ function migrateLocalAgentSessions(sqlite: Database.Database): void {
   `);
 
   addColumnIfMissing(sqlite, "local_agent_sessions", "thinking", "text");
-}
-
-function migrateArtifactExchange(sqlite: Database.Database): void {
-  sqlite.exec(`
-    create table if not exists artifacts (
-      id text primary key,
-      client_id text,
-      workspace_id text,
-      original_name text not null,
-      mime_type text,
-      size integer not null,
-      sha256 text not null,
-      storage_path text not null,
-      source text not null,
-      status text not null,
-      created_at text not null,
-      expires_at text,
-      pinned integer not null default 0,
-      last_used_at text not null
-    );
-
-    create index if not exists artifacts_sha256_storage_idx
-      on artifacts(sha256, storage_path);
-
-    create index if not exists artifacts_expiry_idx
-      on artifacts(status, pinned, expires_at);
-
-    create index if not exists artifacts_workspace_idx
-      on artifacts(workspace_id, last_used_at desc);
-
-    create index if not exists artifacts_client_idx
-      on artifacts(client_id, last_used_at desc);
-
-    create table if not exists artifact_uploads (
-      id text primary key,
-      client_id text,
-      workspace_id text,
-      original_name text not null,
-      mime_type text,
-      expected_size integer,
-      expected_sha256 text,
-      received_size integer not null default 0,
-      temp_path text not null,
-      status text not null,
-      artifact_ttl_hours integer not null,
-      last_chunk_offset integer,
-      last_chunk_size integer,
-      last_chunk_sha256 text,
-      created_at text not null,
-      expires_at text not null
-    );
-
-    create index if not exists artifact_uploads_expiry_idx
-      on artifact_uploads(status, expires_at);
-
-    create index if not exists artifact_uploads_client_idx
-      on artifact_uploads(client_id, created_at desc);
-  `);
 }
 
 function addColumnIfMissing(

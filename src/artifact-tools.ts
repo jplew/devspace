@@ -1,17 +1,20 @@
+import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import {
+  link,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  unlink,
+  type FileHandle,
+} from "node:fs/promises";
+import { basename, extname, join } from "node:path";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { basename, isAbsolute, relative } from "node:path";
 import * as z from "zod/v4";
+import { ArtifactError } from "./artifact-error.js";
 import type { ServerConfig } from "./config.js";
-import {
-  copyArtifactToWorkspace,
-  type ArtifactCopyConflictMode,
-} from "./artifact-workspace.js";
-import {
-  ARTIFACT_CHUNK_BYTES,
-  ArtifactError,
-  type ArtifactStore,
-} from "./artifacts.js";
 import {
   describeIncomingArtifactValue,
   IncomingArtifactAdapterRegistry,
@@ -24,8 +27,17 @@ const ARTIFACT_WRITE_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: true,
   idempotentHint: false,
-  openWorldHint: false,
+  openWorldHint: true,
 };
+const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
+const DIRECTORY_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | NO_FOLLOW;
+const MAX_RENAME_ATTEMPTS = 10_000;
+const MAX_SAFE_FILENAME_BYTES = 180;
+const MAX_SAFE_EXTENSION_BYTES = 32;
+const PARTIAL_PREFIX = ".devspace-download-";
+const PARTIAL_SUFFIX = ".partial";
+const STALE_PARTIAL_AGE_MS = 24 * 60 * 60 * 1_000;
+const MAX_STALE_PARTIAL_CLEANUP = 32;
 
 const openAIFileReferenceInputSchema = z.object({
   download_url: z.string(),
@@ -36,61 +48,36 @@ const openAIFileReferenceInputSchema = z.object({
   size: z.number().int().nonnegative().nullable().optional(),
 });
 
-type ArtifactToolName = "materialize_artifact";
-
 export interface ArtifactToolRegistrationOptions {
   config: ServerConfig;
-  store: ArtifactStore;
   workspaces: WorkspaceRegistry;
-  clientId: string;
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
 }
 
-export interface StageArtifactInput {
-  file: unknown;
-  workspaceId?: string;
-  expectedSha256?: string;
-  ttlHours?: number;
-  pin?: boolean;
-}
-
-export interface StageArtifactResult {
-  artifactId: string;
-  name: string;
-  mimeType?: string;
-  size: number;
-  sha256: string;
-  hostPath: string;
-  expiresAt?: string;
-  instruction: string;
-}
-
-export interface MaterializeArtifactInput {
+export interface DownloadIncomingArtifactInput {
   file: unknown;
   workspaceId: string;
-  destination: string;
-  onConflict: ArtifactCopyConflictMode;
-  expectedSha256?: string;
 }
 
-export interface MaterializeArtifactResult {
-  workspaceId: string;
+export interface DownloadIncomingArtifactResult {
   path: string;
-  name: string;
-  mimeType?: string;
   size: number;
   sha256: string;
-  onConflict: ArtifactCopyConflictMode;
-  renamed: boolean;
+}
+
+interface SecureIncomingDirectory {
+  rootHandle: FileHandle;
+  devspaceHandle: FileHandle;
+  incomingHandle: FileHandle;
+  anchorPath: string;
+  close(): Promise<void>;
 }
 
 export function registerArtifactTools(
   server: McpServer,
   {
     config,
-    store,
     workspaces,
-    clientId,
     incomingArtifactAdapters = [],
   }: ArtifactToolRegistrationOptions,
 ): void {
@@ -98,172 +85,472 @@ export function registerArtifactTools(
 
   registerAppTool(
     server,
-    "materialize_artifact",
+    "download_artifact",
     {
-      title: "Materialize attached or generated file",
+      title: "Download attached or generated file",
       description:
-        "Save one MCP-host-provided native file into an already-open workspace. DevSpace validates the file reference, streams and verifies the bytes, and atomically writes the destination. Arbitrary URLs and host paths are rejected.",
+        "Stream one MCP-host-provided native file into the selected workspace's .devspace/incoming directory. DevSpace chooses a collision-free filename and returns its workspace-relative path. Arbitrary URLs, local paths, and malformed file objects are rejected.",
       inputSchema: {
-        file: openAIFileReferenceInputSchema.describe("Native file value authorized and supplied by the MCP host."),
-        workspaceId: z.string().min(1).describe("Workspace identifier returned by open_workspace."),
-        destination: z.string().min(1).describe("Relative file path inside the selected workspace."),
-        onConflict: z.enum(["error", "rename", "replace"]).default("error").describe("How to handle an existing destination."),
-        expectedSha256: z.string().optional().describe("Optional expected SHA-256, with or without a sha256: prefix."),
+        file: openAIFileReferenceInputSchema.describe(
+          "Native file value authorized and supplied by the MCP host.",
+        ),
+        workspaceId: z.string().min(1).describe(
+          "Workspace identifier returned by open_workspace.",
+        ),
       },
       outputSchema: {
-        workspaceId: z.string(),
         path: z.string(),
-        name: z.string(),
-        mimeType: z.string().optional(),
-        size: z.number().int().nonnegative(),
-        sha256: z.string(),
-        onConflict: z.enum(["error", "rename", "replace"]),
-        renamed: z.boolean(),
       },
       _meta: { "openai/fileParams": ["file"] },
       annotations: ARTIFACT_WRITE_ANNOTATIONS,
     },
-    async (input) => executeArtifactTool(config, "materialize_artifact", input, async () => {
-      if (isAbsolute(input.destination)) {
-        throw new ArtifactError("workspace_destination_invalid", "Artifact destination must be a relative workspace path.");
-      }
+    async (input) => executeArtifactTool(config, input, async () => {
       const workspace = workspaces.getWorkspace(input.workspaceId);
-      const destination = workspaces.resolvePath(workspace, input.destination);
-      return materializeIncomingArtifact({
-        store,
-        clientId,
+      const downloaded = await downloadIncomingArtifact({
         registry: incomingRegistry,
         workspaceId: workspace.id,
         workspaceRoot: workspace.root,
-        destination,
-        input,
+        maxFileBytes: config.artifactMaxFileBytes,
+        file: input.file,
       });
+      return {
+        publicResult: { path: downloaded.path },
+        logResult: downloaded,
+      };
     }),
   );
-
 }
 
-/** Materialize a native file through the private store, then remove its internal record. */
-export async function materializeIncomingArtifact({
-  store,
-  clientId,
+/**
+ * Stream a trusted native file directly into one already-open workspace.
+ *
+ * Bytes are written to an exclusive private partial, hashed and size-checked,
+ * chmodded through the still-open file descriptor, fsynced, and only then
+ * published with an atomic hard link. No path-based chmod/hash/verification is
+ * performed after publication.
+ */
+export async function downloadIncomingArtifact({
   registry,
   workspaceId,
   workspaceRoot,
-  destination,
-  input,
+  maxFileBytes,
+  file,
 }: {
-  store: ArtifactStore;
-  clientId: string;
   registry: IncomingArtifactAdapterRegistry;
   workspaceId: string;
   workspaceRoot: string;
-  destination: string;
-  input: MaterializeArtifactInput;
-}): Promise<MaterializeArtifactResult> {
-  const staged = await stageIncomingArtifact({
-    store,
-    clientId,
-    registry,
-    input: {
-      file: input.file,
-      workspaceId,
-      expectedSha256: input.expectedSha256,
-    },
-  });
-
-  try {
-    const copied = await copyArtifactToWorkspace({
-      store,
-      clientId,
-      workspaceId,
-      workspaceRoot,
-      artifactId: staged.artifactId,
-      destination,
-      onConflict: input.onConflict,
-    });
-    const path = relative(workspaceRoot, copied.path);
-    return {
-      workspaceId,
-      path,
-      name: basename(path),
-      mimeType: staged.mimeType,
-      size: copied.size,
-      sha256: copied.sha256,
-      onConflict: copied.onConflict,
-      renamed: copied.renamed,
-    };
-  } finally {
-    await store.deleteArtifact(clientId, staged.artifactId).catch(() => undefined);
+  maxFileBytes: number;
+  file: unknown;
+}): Promise<DownloadIncomingArtifactResult> {
+  if (!Number.isSafeInteger(maxFileBytes) || maxFileBytes < 1) {
+    throw new ArtifactError(
+      "artifact_limit_invalid",
+      "Artifact file-size limit must be a positive integer.",
+    );
   }
-}
+  if (!workspaceId) {
+    throw new ArtifactError(
+      "artifact_workspace_invalid",
+      "A selected workspace is required for native file download.",
+    );
+  }
 
-export async function stageIncomingArtifact({
-  store,
-  clientId,
-  registry,
-  input,
-}: {
-  store: ArtifactStore;
-  clientId: string;
-  registry: IncomingArtifactAdapterRegistry;
-  input: StageArtifactInput;
-}): Promise<StageArtifactResult> {
-  const opened = await registry.open(input.file);
-  let uploadId: string | undefined;
+  const opened = await registry.open(file);
+  let secureDirectory: SecureIncomingDirectory | undefined;
+  let partialPath: string | undefined;
+  let handle: FileHandle | undefined;
 
   try {
-    const upload = await store.beginUpload(clientId, {
-      filename: opened.name,
-      mimeType: opened.mimeType,
-      size: opened.size,
-      sha256: input.expectedSha256,
-      workspaceId: input.workspaceId,
-      ttlHours: input.ttlHours,
-    });
-    uploadId = upload.uploadId;
-
-    let offset = 0;
-    for await (const value of opened.stream) {
-      const bytes = incomingStreamChunk(value);
-      for (let chunkOffset = 0; chunkOffset < bytes.length; chunkOffset += ARTIFACT_CHUNK_BYTES) {
-        const chunk = bytes.subarray(chunkOffset, chunkOffset + ARTIFACT_CHUNK_BYTES);
-        await store.uploadChunk(clientId, {
-          uploadId,
-          offset,
-          dataBase64: chunk.toString("base64"),
-        });
-        offset += chunk.length;
-      }
+    if (opened.size !== undefined && opened.size > maxFileBytes) {
+      throw new ArtifactError(
+        "artifact_file_too_large",
+        "Native file exceeds the configured per-file limit.",
+      );
     }
 
-    const artifact = await store.commitUpload(clientId, uploadId, {
-      source: `incoming:${opened.adapterId}`,
-      pinned: input.pin === true,
-    });
-    uploadId = undefined;
+    secureDirectory = await prepareIncomingDirectory(workspaceRoot);
+    await cleanupStalePartials(secureDirectory);
+    await assertPrivateDirectoryHandle(secureDirectory.incomingHandle);
+
+    partialPath = join(
+      secureDirectory.anchorPath,
+      `${PARTIAL_PREFIX}${randomUUID()}${PARTIAL_SUFFIX}`,
+    );
+    handle = await open(
+      partialPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW,
+      0o600,
+    );
+
+    const hash = createHash("sha256");
+    let size = 0;
+    for await (const value of opened.stream) {
+      const chunk = incomingStreamChunk(value);
+      if (size + chunk.length > maxFileBytes) {
+        throw new ArtifactError(
+          "artifact_file_too_large",
+          "Native file exceeds the configured per-file limit.",
+        );
+      }
+      await writeAll(handle, chunk, size);
+      hash.update(chunk);
+      size += chunk.length;
+    }
+
+    if (opened.size !== undefined && opened.size !== size) {
+      throw new ArtifactError(
+        "artifact_file_size_mismatch",
+        "Native file metadata did not match the downloaded content.",
+      );
+    }
+
+    await handle.chmod(0o644);
+    await handle.sync();
+    const writtenEntry = await handle.stat();
+    if (!writtenEntry.isFile() || writtenEntry.size !== size) {
+      throw new ArtifactError(
+        "artifact_write_integrity_failed",
+        "Native file could not be verified before publication.",
+      );
+    }
+
+    await assertPrivateDirectoryHandle(secureDirectory.incomingHandle);
+    const partialEntry = await lstat(partialPath);
+    if (
+      partialEntry.isSymbolicLink()
+      || !partialEntry.isFile()
+      || partialEntry.dev !== writtenEntry.dev
+      || partialEntry.ino !== writtenEntry.ino
+      || partialEntry.size !== writtenEntry.size
+    ) {
+      throw new ArtifactError(
+        "artifact_partial_unsafe",
+        "Native file partial changed before publication.",
+      );
+    }
+
+    const safeName = normalizeArtifactFilename(opened.name);
+    const finalName = await publishCollisionFree(
+      secureDirectory,
+      partialPath,
+      safeName,
+    );
+    await unlink(partialPath);
+    partialPath = undefined;
+
     return {
-      artifactId: artifact.artifactId,
-      name: artifact.name,
-      mimeType: artifact.mimeType,
-      size: artifact.size,
-      sha256: artifact.sha256,
-      hostPath: artifact.hostPath,
-      expiresAt: artifact.expiresAt,
-      instruction:
-        "Pass hostPath to a local command. stage_artifact never writes into a workspace or repository.",
+      path: `.devspace/incoming/${finalName}`,
+      size,
+      sha256: `sha256:${hash.digest("hex")}`,
     };
   } catch (error) {
     opened.stream.destroy();
-    if (uploadId) {
-      await store.abortUpload(clientId, uploadId).catch(() => undefined);
+    throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+    if (partialPath) await unlink(partialPath).catch(() => undefined);
+    await secureDirectory?.close().catch(() => undefined);
+  }
+}
+
+export function artifactToolLogFields(
+  input: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    fileProvided: input.file !== undefined,
+    fileReferenceShape: describeIncomingArtifactValue(input.file),
+    downloadUrlHostname: incomingFileDownloadHostname(input.file),
+    workspaceId: input.workspaceId,
+  };
+}
+
+async function executeArtifactTool(
+  config: ServerConfig,
+  input: Record<string, unknown>,
+  operation: () => Promise<{
+    publicResult: { path: string };
+    logResult: DownloadIncomingArtifactResult;
+  }>,
+) {
+  const startedAt = performance.now();
+  try {
+    const { publicResult, logResult } = await operation();
+    if (config.logging.toolCalls) {
+      logEvent(config.logging, "info", "artifact_tool_call", {
+        tool: "download_artifact",
+        ...artifactToolLogFields(input),
+        path: logResult.path,
+        size: logResult.size,
+        sha256: logResult.sha256,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+    }
+    return artifactToolResponse(publicResult);
+  } catch (error) {
+    if (config.logging.toolCalls) {
+      logEvent(config.logging, "warn", "artifact_tool_call", {
+        tool: "download_artifact",
+        ...artifactToolLogFields(input),
+        success: false,
+        errorCode: error instanceof ArtifactError ? error.code : "internal_error",
+        durationMs: Math.round(performance.now() - startedAt),
+      });
     }
     throw error;
   }
 }
 
+function artifactToolResponse(result: { path: string }) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(result) }],
+    structuredContent: result,
+  };
+}
+
+async function prepareIncomingDirectory(
+  workspaceRoot: string,
+): Promise<SecureIncomingDirectory> {
+  let rootHandle: FileHandle | undefined;
+  let devspaceHandle: FileHandle | undefined;
+  let incomingHandle: FileHandle | undefined;
+
+  try {
+    rootHandle = await openDirectoryNoFollow(
+      workspaceRoot,
+      "artifact_workspace_unsafe",
+      "Selected workspace root is not a real directory.",
+    );
+    const rootAnchor = descriptorDirectoryPath(rootHandle);
+    devspaceHandle = await ensureChildDirectory(rootHandle, rootAnchor, ".devspace");
+    const devspaceAnchor = descriptorDirectoryPath(devspaceHandle);
+    incomingHandle = await ensureChildDirectory(
+      devspaceHandle,
+      devspaceAnchor,
+      "incoming",
+    );
+    const anchorPath = descriptorDirectoryPath(incomingHandle);
+
+    return {
+      rootHandle,
+      devspaceHandle,
+      incomingHandle,
+      anchorPath,
+      async close() {
+        await incomingHandle?.close().catch(() => undefined);
+        await devspaceHandle?.close().catch(() => undefined);
+        await rootHandle?.close().catch(() => undefined);
+      },
+    };
+  } catch (error) {
+    await incomingHandle?.close().catch(() => undefined);
+    await devspaceHandle?.close().catch(() => undefined);
+    await rootHandle?.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function ensureChildDirectory(
+  parentHandle: FileHandle,
+  parentAnchor: string,
+  name: string,
+): Promise<FileHandle> {
+  await assertDirectoryHandle(parentHandle);
+  const path = join(parentAnchor, name);
+  try {
+    await mkdir(path, { mode: 0o700 });
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "EEXIST") throw error;
+  }
+
+  const child = await openDirectoryNoFollow(
+    path,
+    "artifact_directory_unsafe",
+    "Artifact destination parent is not a real directory.",
+  );
+  try {
+    await assertPrivateDirectoryHandle(child);
+    return child;
+  } catch (error) {
+    await child.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function openDirectoryNoFollow(
+  path: string,
+  code: string,
+  message: string,
+): Promise<FileHandle> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(path, DIRECTORY_FLAGS);
+    await assertDirectoryHandle(handle);
+    return handle;
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if (error instanceof ArtifactError) throw error;
+    throw new ArtifactError(code, message);
+  }
+}
+
+async function assertDirectoryHandle(handle: FileHandle): Promise<void> {
+  const entry = await handle.stat();
+  if (!entry.isDirectory()) {
+    throw new ArtifactError(
+      "artifact_directory_unsafe",
+      "Artifact destination parent is not a directory.",
+    );
+  }
+}
+
+async function assertPrivateDirectoryHandle(handle: FileHandle): Promise<void> {
+  const entry = await handle.stat();
+  if (!entry.isDirectory()) {
+    throw new ArtifactError(
+      "artifact_directory_unsafe",
+      "Artifact destination parent is not a directory.",
+    );
+  }
+  if (process.platform === "win32") return;
+  const currentUid = process.getuid?.();
+  if (
+    (currentUid !== undefined && entry.uid !== currentUid)
+    || (Number(entry.mode) & 0o022) !== 0
+  ) {
+    throw new ArtifactError(
+      "artifact_directory_permissions_unsafe",
+      "Artifact destination directory must be owned by the current user and not group/world writable.",
+    );
+  }
+}
+
+function descriptorDirectoryPath(handle: FileHandle): string {
+  if (process.platform === "linux") return `/proc/self/fd/${handle.fd}`;
+  if (["darwin", "freebsd", "openbsd", "netbsd"].includes(process.platform)) {
+    return `/dev/fd/${handle.fd}`;
+  }
+  throw new ArtifactError(
+    "artifact_platform_unsupported",
+    "Native file download requires descriptor-anchored directory operations on this platform.",
+  );
+}
+
+async function publishCollisionFree(
+  directory: SecureIncomingDirectory,
+  partialPath: string,
+  filename: string,
+): Promise<string> {
+  for (let attempt = 0; attempt < MAX_RENAME_ATTEMPTS; attempt += 1) {
+    await assertPrivateDirectoryHandle(directory.incomingHandle);
+    const candidateName = attempt === 0
+      ? filename
+      : renamedFilename(filename, attempt);
+    const candidate = join(directory.anchorPath, candidateName);
+    try {
+      await link(partialPath, candidate);
+      return candidateName;
+    } catch (error) {
+      if (isNodeError(error) && error.code === "EEXIST") continue;
+      throw error;
+    }
+  }
+  throw new ArtifactError(
+    "artifact_filename_exhausted",
+    "Could not choose an available incoming filename.",
+  );
+}
+
+export function normalizeArtifactFilename(value: string): string {
+  const flattened = value.replaceAll("\\", "/");
+  let candidate = basename(flattened)
+    .replace(/[\u0000-\u001F\u007F]/gu, "")
+    .trim();
+  if (!candidate || candidate === "." || candidate === ".." || candidate.startsWith(".")) {
+    candidate = "download.bin";
+  }
+
+  const extension = extname(candidate);
+  const safeExtension = Buffer.byteLength(extension, "utf8") <= MAX_SAFE_EXTENSION_BYTES
+    ? extension
+    : "";
+  const stemCharacters = Array.from(
+    safeExtension ? candidate.slice(0, -safeExtension.length) : candidate,
+  );
+  while (
+    stemCharacters.length > 1
+    && Buffer.byteLength(`${stemCharacters.join("")}${safeExtension}`, "utf8")
+      > MAX_SAFE_FILENAME_BYTES
+  ) {
+    stemCharacters.pop();
+  }
+  candidate = `${stemCharacters.join("")}${safeExtension}`;
+  return Buffer.byteLength(candidate, "utf8") <= MAX_SAFE_FILENAME_BYTES
+    ? candidate
+    : "download.bin";
+}
+
+function renamedFilename(filename: string, attempt: number): string {
+  const extension = extname(filename);
+  const stem = extension ? filename.slice(0, -extension.length) : filename;
+  return `${stem} (${attempt})${extension}`;
+}
+
+async function cleanupStalePartials(
+  directory: SecureIncomingDirectory,
+): Promise<void> {
+  await assertPrivateDirectoryHandle(directory.incomingHandle);
+  const entries = await readdir(directory.anchorPath, { withFileTypes: true });
+  let inspected = 0;
+  const cutoff = Date.now() - STALE_PARTIAL_AGE_MS;
+  for (const entry of entries) {
+    if (inspected >= MAX_STALE_PARTIAL_CLEANUP) break;
+    if (
+      !entry.name.startsWith(PARTIAL_PREFIX)
+      || !entry.name.endsWith(PARTIAL_SUFFIX)
+    ) continue;
+    inspected += 1;
+
+    const path = join(directory.anchorPath, entry.name);
+    const metadata = await lstatOrUndefined(path);
+    if (
+      !metadata
+      || metadata.isSymbolicLink()
+      || !metadata.isFile()
+      || metadata.mtimeMs >= cutoff
+      || (process.getuid?.() !== undefined && metadata.uid !== process.getuid?.())
+    ) continue;
+    await unlink(path).catch(() => undefined);
+  }
+}
+
+async function writeAll(
+  handle: FileHandle,
+  buffer: Buffer,
+  position: number,
+): Promise<void> {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const { bytesWritten } = await handle.write(
+      buffer,
+      offset,
+      buffer.length - offset,
+      position + offset,
+    );
+    if (bytesWritten <= 0) {
+      throw new ArtifactError(
+        "artifact_short_write",
+        "Native file was not fully written.",
+      );
+    }
+    offset += bytesWritten;
+  }
+}
+
 function incomingFileDownloadHostname(value: unknown): string | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
   const rawUrl = (value as Record<string, unknown>).download_url;
   if (typeof rawUrl !== "string") return undefined;
   try {
@@ -286,67 +573,15 @@ function incomingStreamChunk(value: unknown): Buffer {
   );
 }
 
-export function artifactToolLogFields(
-  tool: ArtifactToolName,
-  input: Record<string, unknown>,
-): Record<string, unknown> {
-  return {
-    fileProvided: input.file !== undefined,
-    fileReferenceShape: describeIncomingArtifactValue(input.file),
-    downloadUrlHostname: incomingFileDownloadHostname(input.file),
-    workspaceId: input.workspaceId,
-    destination: input.destination,
-    expectedSha256Present: typeof input.expectedSha256 === "string",
-    onConflict: input.onConflict,
-  };
-}
-
-async function executeArtifactTool<T extends object>(
-  config: ServerConfig,
-  tool: ArtifactToolName,
-  input: Record<string, unknown>,
-  operation: () => Promise<T> | T,
-) {
-  const startedAt = performance.now();
+async function lstatOrUndefined(path: string) {
   try {
-    const result = await operation();
-    if (config.logging.toolCalls) {
-      logEvent(config.logging, "info", "artifact_tool_call", {
-        tool,
-        ...artifactToolLogFields(tool, input),
-        ...artifactResultLogFields(result as Record<string, unknown>),
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
-      });
-    }
-    return artifactToolResponse(result);
+    return await lstat(path);
   } catch (error) {
-    if (config.logging.toolCalls) {
-      logEvent(config.logging, "warn", "artifact_tool_call", {
-        tool,
-        ...artifactToolLogFields(tool, input),
-        success: false,
-        errorCode: error instanceof ArtifactError ? error.code : "internal_error",
-        durationMs: Math.round(performance.now() - startedAt),
-      });
-    }
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
     throw error;
   }
 }
 
-function artifactToolResponse<T extends object>(result: T) {
-  return {
-    content: [{ type: "text" as const, text: JSON.stringify(result) }],
-    structuredContent: result as Record<string, unknown>,
-  };
-}
-
-function artifactResultLogFields(result: Record<string, unknown>): Record<string, unknown> {
-  return {
-    workspaceId: result.workspaceId,
-    path: result.path,
-    size: result.size,
-    sha256: result.sha256,
-    renamed: result.renamed,
-  };
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }

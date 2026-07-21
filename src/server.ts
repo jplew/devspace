@@ -19,10 +19,6 @@ import type { Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch } from "./apply-patch.js";
 import { registerArtifactTools } from "./artifact-tools.js";
-import {
-  ARTIFACT_CLEANUP_INTERVAL_MS,
-  ArtifactStore,
-} from "./artifacts.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
 import {
   createOpenAIIncomingArtifactAdapter,
@@ -189,7 +185,7 @@ interface ToolLogFields {
 
 function serverInstructions(config: ServerConfig): string {
   const artifactInstruction = config.artifactsEnabled
-    ? " When the user supplies or generates a file that is not present on the DevSpace host, use materialize_artifact with its native file value, the existing workspace ID, a relative destination, and an explicit conflict mode. Do not recreate binary files with write/edit calls. Do not place signed URLs, native file objects, base64 content, or invented artifact-storage paths in shell commands or logs. materialize_artifact validates, streams, verifies, and writes the file into the selected workspace; it may dirty a repository."
+    ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value and the existing workspace ID. DevSpace chooses a collision-free path under .devspace/incoming and returns that workspace-relative path. Use the normal workspace tools for any later move, rename, or deletion. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
     : "";
   const showChangesInstruction =
     config.widgets === "changes"
@@ -700,8 +696,6 @@ function createMcpServer(
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
   localAgentProviders: LocalAgentProviderAvailability[],
-  artifactStore: ArtifactStore | undefined,
-  clientId: string,
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
 ): McpServer {
   const server = new McpServer(
@@ -1609,12 +1603,10 @@ function createMcpServer(
     registerCodexProcessTools(server, config, workspaces, processSessions);
   }
 
-  if (artifactStore) {
+  if (config.artifactsEnabled) {
     registerArtifactTools(server, {
       config,
-      store: artifactStore,
       workspaces,
-      clientId,
       incomingArtifactAdapters,
     });
   }
@@ -1649,7 +1641,6 @@ export function createServer(
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
-  const artifactStore = config.artifactsEnabled ? new ArtifactStore(config) : undefined;
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
@@ -1687,24 +1678,6 @@ export function createServer(
       .then((results) => logSessionCloseResults("idle_timeout", results));
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
   sessionCleanupTimer.unref();
-
-  const runArtifactCleanup = () => {
-    if (!artifactStore) return;
-    void artifactStore.cleanupExpired()
-      .then((result) => {
-        logEvent(config.logging, "debug", "artifact_cleanup", { ...result });
-      })
-      .catch((error) => {
-        logEvent(config.logging, "warn", "artifact_cleanup_failed", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
-  };
-  runArtifactCleanup();
-  const artifactCleanupTimer = artifactStore
-    ? setInterval(runArtifactCleanup, ARTIFACT_CLEANUP_INTERVAL_MS)
-    : undefined;
-  artifactCleanupTimer?.unref();
 
   if (config.logging.trustProxy) {
     app.set("trust proxy", true);
@@ -1834,8 +1807,6 @@ export function createServer(
           reviewCheckpoints,
           processSessions,
           localAgentProviders,
-          artifactStore,
-          req.auth.clientId,
           incomingArtifactAdapters,
         );
         await server.connect(transport);
@@ -1864,12 +1835,10 @@ export function createServer(
     close: () => {
       closePromise ??= (async () => {
         clearInterval(sessionCleanupTimer);
-        if (artifactCleanupTimer) clearInterval(artifactCleanupTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();
         oauthProvider.close();
-        artifactStore?.close();
         workspaceStore.close?.();
       })();
       return closePromise;
@@ -1897,10 +1866,7 @@ if (await isMainModule()) {
     console.log(`request logging: ${config.logging.requests ? "enabled" : "disabled"}`);
     console.log(`asset logging: ${config.logging.assets ? "enabled" : "disabled"}`);
     console.log(`trust proxy: ${config.logging.trustProxy ? "enabled" : "disabled"}`);
-    console.log(`native artifact staging: ${config.artifactsEnabled ? "enabled" : "disabled"}`);
-    if (config.artifactsEnabled) {
-      console.log(`artifact root: ${config.artifactRoot}`);
-    }
+    console.log(`native artifact download: ${config.artifactsEnabled ? "enabled" : "disabled"}`);
     if (config.subagents) {
       console.log(`subagent providers: ${formatLocalAgentProviderAvailabilitySummary(localAgentProviders)}`);
     }

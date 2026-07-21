@@ -18,10 +18,7 @@ export interface DevspaceUserConfig {
   stateDir?: string;
   worktreeRoot?: string;
   artifactsEnabled?: boolean;
-  artifactRoot?: string;
   artifactMaxFileBytes?: number;
-  artifactMaxTotalBytes?: number;
-  artifactDefaultTtlHours?: number;
   agentDir?: string;
   subagents?: boolean;
 }

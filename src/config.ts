@@ -10,9 +10,6 @@ export type WidgetMode = "off" | "changes" | "full";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
-const DEFAULT_ARTIFACT_MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
-const DEFAULT_ARTIFACT_TTL_HOURS = 24;
-export const MAX_ARTIFACT_TTL_HOURS = 24 * 365;
 
 export interface ServerConfig {
   host: string;
@@ -26,10 +23,7 @@ export interface ServerConfig {
   stateDir: string;
   worktreeRoot: string;
   artifactsEnabled: boolean;
-  artifactRoot: string;
   artifactMaxFileBytes: number;
-  artifactMaxTotalBytes: number;
-  artifactDefaultTtlHours: number;
   skillsEnabled: boolean;
   skillPaths: string[];
   devspaceSkillsDir: string;
@@ -209,10 +203,6 @@ function defaultWorktreeRoot(): string {
   return join(homedir(), ".devspace", "worktrees");
 }
 
-function defaultArtifactRoot(): string {
-  return join(homedir(), ".local", "share", "devspace", "artifacts");
-}
-
 function defaultAgentDir(): string {
   return join(homedir(), ".codex");
 }
@@ -248,24 +238,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       env.DEVSPACE_ARTIFACTS === undefined
         ? files.config.artifactsEnabled === true
         : parseBoolean(env.DEVSPACE_ARTIFACTS),
-    artifactRoot: resolve(expandHomePath(
-      env.DEVSPACE_ARTIFACT_ROOT ?? files.config.artifactRoot ?? defaultArtifactRoot(),
-    )),
     artifactMaxFileBytes: parsePositiveInteger(
       env.DEVSPACE_ARTIFACT_MAX_FILE_BYTES ?? numberConfigValue(files.config.artifactMaxFileBytes),
       DEFAULT_ARTIFACT_MAX_FILE_BYTES,
       "DEVSPACE_ARTIFACT_MAX_FILE_BYTES",
-    ),
-    artifactMaxTotalBytes: parsePositiveInteger(
-      env.DEVSPACE_ARTIFACT_MAX_TOTAL_BYTES ?? numberConfigValue(files.config.artifactMaxTotalBytes),
-      DEFAULT_ARTIFACT_MAX_TOTAL_BYTES,
-      "DEVSPACE_ARTIFACT_MAX_TOTAL_BYTES",
-    ),
-    artifactDefaultTtlHours: parsePositiveInteger(
-      env.DEVSPACE_ARTIFACT_TTL_HOURS ?? numberConfigValue(files.config.artifactDefaultTtlHours),
-      DEFAULT_ARTIFACT_TTL_HOURS,
-      "DEVSPACE_ARTIFACT_TTL_HOURS",
-      MAX_ARTIFACT_TTL_HOURS,
     ),
     skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS),
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
