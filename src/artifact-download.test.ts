@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -31,6 +32,7 @@ try {
   await testSafeDownloadAndCollision(join(root, "downloads"));
   await testSizeLimitAndCleanup(join(root, "size-limit"));
   await testCrashLeftoverCleanup(join(root, "stale-partials"));
+  await testUnsafeDirectoryPermissions(join(root, "unsafe-permissions"));
   await testSymlinkRejection(join(root, "symlinks"));
   testLogRedaction();
 } finally {
@@ -186,14 +188,34 @@ async function testCrashLeftoverCleanup(testRoot: string): Promise<void> {
   assert.equal(entries.includes("keep-me.partial"), true);
 }
 
+async function testUnsafeDirectoryPermissions(testRoot: string): Promise<void> {
+  if (process.platform === "win32") return;
+
+  const workspaceRoot = join(testRoot, "workspace");
+  const devspaceDirectory = join(workspaceRoot, ".devspace");
+  await mkdir(devspaceDirectory, { recursive: true, mode: 0o700 });
+  await chmod(devspaceDirectory, 0o777);
+
+  await expectArtifactError(
+    downloadIncomingArtifact({
+      registry: registryFor({ name: "blocked.txt", stream: Readable.from(["blocked"]) }),
+      workspaceId: "ws_test",
+      workspaceRoot,
+      maxFileBytes: 1024,
+      file: { native: true },
+    }),
+    "artifact_directory_permissions_unsafe",
+  );
+}
+
 async function testSymlinkRejection(testRoot: string): Promise<void> {
   if (process.platform === "win32") return;
 
   const outside = join(testRoot, "outside");
-  await mkdir(outside, { recursive: true });
+  await mkdir(outside, { recursive: true, mode: 0o700 });
 
   const linkedDevspaceRoot = join(testRoot, "linked-devspace-workspace");
-  await mkdir(linkedDevspaceRoot, { recursive: true });
+  await mkdir(linkedDevspaceRoot, { recursive: true, mode: 0o700 });
   await symlink(outside, join(linkedDevspaceRoot, ".devspace"), "dir");
   await expectArtifactError(
     downloadIncomingArtifact({
@@ -207,7 +229,10 @@ async function testSymlinkRejection(testRoot: string): Promise<void> {
   );
 
   const linkedIncomingRoot = join(testRoot, "linked-incoming-workspace");
-  await mkdir(join(linkedIncomingRoot, ".devspace"), { recursive: true });
+  await mkdir(join(linkedIncomingRoot, ".devspace"), {
+    recursive: true,
+    mode: 0o700,
+  });
   await symlink(outside, join(linkedIncomingRoot, ".devspace", "incoming"), "dir");
   await expectArtifactError(
     downloadIncomingArtifact({
