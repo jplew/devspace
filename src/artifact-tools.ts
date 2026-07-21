@@ -9,7 +9,7 @@ import {
   unlink,
   type FileHandle,
 } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { isAbsolute, join, normalize, sep } from "node:path";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
@@ -25,15 +25,12 @@ import type { WorkspaceRegistry } from "./workspaces.js";
 
 const ARTIFACT_WRITE_ANNOTATIONS = {
   readOnlyHint: false,
-  destructiveHint: true,
+  destructiveHint: false,
   idempotentHint: false,
   openWorldHint: true,
 };
 const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 const DIRECTORY_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | NO_FOLLOW;
-const MAX_RENAME_ATTEMPTS = 10_000;
-const MAX_SAFE_FILENAME_BYTES = 180;
-const MAX_SAFE_EXTENSION_BYTES = 32;
 const PARTIAL_PREFIX = ".devspace-download-";
 const PARTIAL_SUFFIX = ".partial";
 const STALE_PARTIAL_AGE_MS = 24 * 60 * 60 * 1_000;
@@ -57,6 +54,7 @@ export interface ArtifactToolRegistrationOptions {
 export interface DownloadIncomingArtifactInput {
   file: unknown;
   workspaceId: string;
+  path: string;
 }
 
 export interface DownloadIncomingArtifactResult {
@@ -71,6 +69,18 @@ interface SecureIncomingDirectory {
   incomingHandle: FileHandle;
   anchorPath: string;
   close(): Promise<void>;
+}
+
+interface SecureDestinationDirectory {
+  handle: FileHandle;
+  anchorPath: string;
+  close(): Promise<void>;
+}
+
+interface ArtifactDestination {
+  path: string;
+  parentParts: string[];
+  name: string;
 }
 
 export function registerArtifactTools(
@@ -89,13 +99,16 @@ export function registerArtifactTools(
     {
       title: "Download attached or generated file",
       description:
-        "Stream one MCP-host-provided native file into the selected workspace's .devspace/incoming directory. DevSpace chooses a collision-free filename and returns its workspace-relative path. Arbitrary URLs, local paths, and malformed file objects are rejected.",
+        "Stream one MCP-host-provided native file to a requested relative path inside an already-open workspace. Existing destinations, arbitrary URLs, absolute paths, traversal, symlinked parents, local source paths, and malformed file objects are rejected.",
       inputSchema: {
         file: openAIFileReferenceInputSchema.describe(
           "Native file value authorized and supplied by the MCP host.",
         ),
         workspaceId: z.string().min(1).describe(
           "Workspace identifier returned by open_workspace.",
+        ),
+        path: z.string().min(1).describe(
+          "Relative destination path inside the selected workspace. The destination must not already exist.",
         ),
       },
       outputSchema: {
@@ -112,6 +125,7 @@ export function registerArtifactTools(
         workspaceRoot: workspace.root,
         maxFileBytes: config.artifactMaxFileBytes,
         file: input.file,
+        path: input.path,
       });
       return {
         publicResult: { path: downloaded.path },
@@ -126,8 +140,8 @@ export function registerArtifactTools(
  *
  * Bytes are written to an exclusive private partial, hashed and size-checked,
  * chmodded through the still-open file descriptor, fsynced, and only then
- * published with an atomic hard link. No path-based chmod/hash/verification is
- * performed after publication.
+ * published without overwriting the requested workspace destination. No
+ * path-based chmod or hashing is performed after publication.
  */
 export async function downloadIncomingArtifact({
   registry,
@@ -135,12 +149,14 @@ export async function downloadIncomingArtifact({
   workspaceRoot,
   maxFileBytes,
   file,
+  path,
 }: {
   registry: IncomingArtifactAdapterRegistry;
   workspaceId: string;
   workspaceRoot: string;
   maxFileBytes: number;
   file: unknown;
+  path: string;
 }): Promise<DownloadIncomingArtifactResult> {
   if (!Number.isSafeInteger(maxFileBytes) || maxFileBytes < 1) {
     throw new ArtifactError(
@@ -155,8 +171,10 @@ export async function downloadIncomingArtifact({
     );
   }
 
+  const destination = normalizeArtifactDestination(path);
   const opened = await registry.open(file);
   let secureDirectory: SecureIncomingDirectory | undefined;
+  let destinationDirectory: SecureDestinationDirectory | undefined;
   let partialPath: string | undefined;
   let handle: FileHandle | undefined;
 
@@ -229,17 +247,21 @@ export async function downloadIncomingArtifact({
       );
     }
 
-    const safeName = normalizeArtifactFilename(opened.name);
-    const finalName = await publishCollisionFree(
-      secureDirectory,
-      partialPath,
-      safeName,
+    destinationDirectory = await prepareDestinationDirectory(
+      secureDirectory.rootHandle,
+      destination.parentParts,
     );
-    await unlink(partialPath);
+    await publishDestination(
+      destinationDirectory,
+      partialPath,
+      destination.name,
+      writtenEntry,
+    );
+    await unlink(partialPath).catch(() => undefined);
     partialPath = undefined;
 
     return {
-      path: `.devspace/incoming/${finalName}`,
+      path: destination.path,
       size,
       sha256: `sha256:${hash.digest("hex")}`,
     };
@@ -249,6 +271,7 @@ export async function downloadIncomingArtifact({
   } finally {
     await handle?.close().catch(() => undefined);
     if (partialPath) await unlink(partialPath).catch(() => undefined);
+    await destinationDirectory?.close().catch(() => undefined);
     await secureDirectory?.close().catch(() => undefined);
   }
 }
@@ -261,6 +284,7 @@ export function artifactToolLogFields(
     fileReferenceShape: describeIncomingArtifactValue(input.file),
     downloadUrlHostname: incomingFileDownloadHostname(input.file),
     workspaceId: input.workspaceId,
+    path: input.path,
   };
 }
 
@@ -322,12 +346,18 @@ async function prepareIncomingDirectory(
       "Selected workspace root is not a real directory.",
     );
     const rootAnchor = descriptorDirectoryPath(rootHandle);
-    devspaceHandle = await ensureChildDirectory(rootHandle, rootAnchor, ".devspace");
+    devspaceHandle = await ensureChildDirectory(
+      rootHandle,
+      rootAnchor,
+      ".devspace",
+      false,
+    );
     const devspaceAnchor = descriptorDirectoryPath(devspaceHandle);
     incomingHandle = await ensureChildDirectory(
       devspaceHandle,
       devspaceAnchor,
       "incoming",
+      true,
     );
     const anchorPath = descriptorDirectoryPath(incomingHandle);
 
@@ -354,6 +384,7 @@ async function ensureChildDirectory(
   parentHandle: FileHandle,
   parentAnchor: string,
   name: string,
+  privateAccess: boolean,
 ): Promise<FileHandle> {
   await assertDirectoryHandle(parentHandle);
   const path = join(parentAnchor, name);
@@ -369,11 +400,36 @@ async function ensureChildDirectory(
     "Artifact destination parent is not a real directory.",
   );
   try {
-    await assertPrivateDirectoryHandle(child);
+    if (privateAccess) {
+      await assertPrivateDirectoryHandle(child);
+    } else {
+      await assertOwnedDirectoryHandle(child);
+    }
     return child;
   } catch (error) {
     await child.close().catch(() => undefined);
     throw error;
+  }
+}
+
+async function assertOwnedDirectoryHandle(handle: FileHandle): Promise<void> {
+  const entry = await handle.stat();
+  if (!entry.isDirectory()) {
+    throw new ArtifactError(
+      "artifact_directory_unsafe",
+      "Artifact staging parent is not a directory.",
+    );
+  }
+  if (process.platform === "win32") return;
+  const currentUid = process.getuid?.();
+  if (
+    (currentUid !== undefined && entry.uid !== currentUid)
+    || (Number(entry.mode) & 0o022) !== 0
+  ) {
+    throw new ArtifactError(
+      "artifact_directory_permissions_unsafe",
+      "Artifact staging parent must be owned by the current user and not group/world writable.",
+    );
   }
 }
 
@@ -416,11 +472,11 @@ async function assertPrivateDirectoryHandle(handle: FileHandle): Promise<void> {
   const currentUid = process.getuid?.();
   if (
     (currentUid !== undefined && entry.uid !== currentUid)
-    || (Number(entry.mode) & 0o022) !== 0
+    || (Number(entry.mode) & 0o777) !== 0o700
   ) {
     throw new ArtifactError(
       "artifact_directory_permissions_unsafe",
-      "Artifact destination directory must be owned by the current user and not group/world writable.",
+      "Artifact staging directory must be owned by and accessible only to the current user.",
     );
   }
 }
@@ -436,64 +492,147 @@ function descriptorDirectoryPath(handle: FileHandle): string {
   );
 }
 
-async function publishCollisionFree(
-  directory: SecureIncomingDirectory,
+function normalizeArtifactDestination(value: string): ArtifactDestination {
+  const rawParts = value.split(sep);
+  if (
+    !value
+    || value.includes("\u0000")
+    || isAbsolute(value)
+    || value.endsWith(sep)
+    || rawParts.includes("..")
+  ) {
+    throw new ArtifactError(
+      "artifact_destination_invalid",
+      "Artifact destination must be a non-empty relative file path inside the workspace.",
+    );
+  }
+
+  const normalized = normalize(value);
+  if (
+    normalized === "."
+    || normalized === ".."
+    || normalized.startsWith(`..${sep}`)
+  ) {
+    throw new ArtifactError(
+      "artifact_destination_invalid",
+      "Artifact destination must stay inside the selected workspace.",
+    );
+  }
+
+  const parts = normalized.split(sep);
+  const name = parts.at(-1);
+  if (!name || name === "." || name === "..") {
+    throw new ArtifactError(
+      "artifact_destination_invalid",
+      "Artifact destination must name a file inside the selected workspace.",
+    );
+  }
+
+  return {
+    path: normalized,
+    parentParts: parts.slice(0, -1),
+    name,
+  };
+}
+
+async function prepareDestinationDirectory(
+  rootHandle: FileHandle,
+  parentParts: readonly string[],
+): Promise<SecureDestinationDirectory> {
+  const openedHandles: FileHandle[] = [];
+  let parentHandle = rootHandle;
+  let parentAnchor = descriptorDirectoryPath(rootHandle);
+
+  try {
+    for (const part of parentParts) {
+      const child = await ensureWorkspaceChildDirectory(
+        parentHandle,
+        parentAnchor,
+        part,
+      );
+      openedHandles.push(child);
+      parentHandle = child;
+      parentAnchor = descriptorDirectoryPath(child);
+    }
+
+    return {
+      handle: parentHandle,
+      anchorPath: parentAnchor,
+      async close() {
+        for (const handle of openedHandles.reverse()) {
+          await handle.close().catch(() => undefined);
+        }
+      },
+    };
+  } catch (error) {
+    for (const handle of openedHandles.reverse()) {
+      await handle.close().catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+async function ensureWorkspaceChildDirectory(
+  parentHandle: FileHandle,
+  parentAnchor: string,
+  name: string,
+): Promise<FileHandle> {
+  await assertDirectoryHandle(parentHandle);
+  const path = join(parentAnchor, name);
+  try {
+    await mkdir(path, { mode: 0o755 });
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "EEXIST") throw error;
+  }
+
+  return openDirectoryNoFollow(
+    path,
+    "artifact_destination_parent_unsafe",
+    "Artifact destination parent must be a real directory inside the workspace.",
+  );
+}
+
+async function publishDestination(
+  directory: SecureDestinationDirectory,
   partialPath: string,
   filename: string,
-): Promise<string> {
-  for (let attempt = 0; attempt < MAX_RENAME_ATTEMPTS; attempt += 1) {
-    await assertPrivateDirectoryHandle(directory.incomingHandle);
-    const candidateName = attempt === 0
-      ? filename
-      : renamedFilename(filename, attempt);
-    const candidate = join(directory.anchorPath, candidateName);
-    try {
-      await link(partialPath, candidate);
-      return candidateName;
-    } catch (error) {
-      if (isNodeError(error) && error.code === "EEXIST") continue;
-      throw error;
+  writtenEntry: Awaited<ReturnType<FileHandle["stat"]>>,
+): Promise<void> {
+  await assertDirectoryHandle(directory.handle);
+  const candidate = join(directory.anchorPath, filename);
+  let published = false;
+  try {
+    await link(partialPath, candidate);
+    published = true;
+    const publishedEntry = await lstat(candidate);
+    if (
+      publishedEntry.isSymbolicLink()
+      || !publishedEntry.isFile()
+      || publishedEntry.dev !== writtenEntry.dev
+      || publishedEntry.ino !== writtenEntry.ino
+      || publishedEntry.size !== writtenEntry.size
+    ) {
+      throw new ArtifactError(
+        "artifact_destination_publish_failed",
+        "Published artifact did not match the verified download.",
+      );
     }
+  } catch (error) {
+    if (published) await unlink(candidate).catch(() => undefined);
+    if (isNodeError(error) && error.code === "EEXIST") {
+      throw new ArtifactError(
+        "artifact_destination_exists",
+        "Artifact destination already exists.",
+      );
+    }
+    if (isNodeError(error) && error.code === "EXDEV") {
+      throw new ArtifactError(
+        "artifact_destination_filesystem_unsupported",
+        "Artifact staging and destination must be on the same filesystem.",
+      );
+    }
+    throw error;
   }
-  throw new ArtifactError(
-    "artifact_filename_exhausted",
-    "Could not choose an available incoming filename.",
-  );
-}
-
-export function normalizeArtifactFilename(value: string): string {
-  const flattened = value.replaceAll("\\", "/");
-  let candidate = basename(flattened)
-    .replace(/[\u0000-\u001F\u007F]/gu, "")
-    .trim();
-  if (!candidate || candidate === "." || candidate === ".." || candidate.startsWith(".")) {
-    candidate = "download.bin";
-  }
-
-  const extension = extname(candidate);
-  const safeExtension = Buffer.byteLength(extension, "utf8") <= MAX_SAFE_EXTENSION_BYTES
-    ? extension
-    : "";
-  const stemCharacters = Array.from(
-    safeExtension ? candidate.slice(0, -safeExtension.length) : candidate,
-  );
-  while (
-    stemCharacters.length > 1
-    && Buffer.byteLength(`${stemCharacters.join("")}${safeExtension}`, "utf8")
-      > MAX_SAFE_FILENAME_BYTES
-  ) {
-    stemCharacters.pop();
-  }
-  candidate = `${stemCharacters.join("")}${safeExtension}`;
-  return Buffer.byteLength(candidate, "utf8") <= MAX_SAFE_FILENAME_BYTES
-    ? candidate
-    : "download.bin";
-}
-
-function renamedFilename(filename: string, attempt: number): string {
-  const extension = extname(filename);
-  const stem = extension ? filename.slice(0, -extension.length) : filename;
-  return `${stem} (${attempt})${extension}`;
 }
 
 async function cleanupStalePartials(

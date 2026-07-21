@@ -29,11 +29,13 @@ const root = await mkdtemp(join(tmpdir(), "devspace-artifact-download-test-"));
 
 try {
   testOneToolContract();
-  await testSafeDownloadAndCollision(join(root, "downloads"));
+  await testSafeDownloadAndConflict(join(root, "downloads"));
+  await testDestinationValidation(join(root, "destinations"));
   await testSizeLimitAndCleanup(join(root, "size-limit"));
   await testCrashLeftoverCleanup(join(root, "stale-partials"));
   await testUnsafeDirectoryPermissions(join(root, "unsafe-permissions"));
   await testSymlinkRejection(join(root, "symlinks"));
+  await testPrivateStagingPermissions(join(root, "permissions"));
   testLogRedaction();
 } finally {
   await rm(root, { recursive: true, force: true });
@@ -64,8 +66,9 @@ function testOneToolContract(): void {
   const descriptor = registered.get("download_artifact")?.descriptor;
   assert.ok(descriptor);
   assert.deepEqual(descriptor._meta, { "openai/fileParams": ["file"] });
-  assert.deepEqual(Object.keys(descriptor.inputSchema as object).sort(), ["file", "workspaceId"]);
+  assert.deepEqual(Object.keys(descriptor.inputSchema as object).sort(), ["file", "path", "workspaceId"]);
   assert.deepEqual(Object.keys(descriptor.outputSchema as object), ["path"]);
+  assert.equal((descriptor.annotations as { destructiveHint?: boolean }).destructiveHint, false);
 
   const fileSchema = (descriptor.inputSchema as z.ZodRawShape).file as z.ZodType;
   const valid = {
@@ -78,7 +81,7 @@ function testOneToolContract(): void {
   assert.throws(() => fileSchema.parse({ file_id: "file_123" }));
 }
 
-async function testSafeDownloadAndCollision(testRoot: string): Promise<void> {
+async function testSafeDownloadAndConflict(testRoot: string): Promise<void> {
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot, { recursive: true });
   const bytes = Buffer.from("native artifact bytes\u0000\xff", "latin1");
@@ -94,26 +97,46 @@ async function testSafeDownloadAndCollision(testRoot: string): Promise<void> {
     workspaceRoot,
     maxFileBytes: 1024,
     file: { native: true },
+    path: "public/images/generated.png",
   });
-  assert.equal(first.path, ".devspace/incoming/generated.png");
+  assert.equal(first.path, "public/images/generated.png");
   assert.deepEqual(await readFile(join(workspaceRoot, first.path)), bytes);
 
-  const second = await downloadIncomingArtifact({
-    registry: registryFor({
-      name: "generated.png",
-      size: bytes.length,
-      stream: Readable.from([bytes]),
+  await expectArtifactError(
+    downloadIncomingArtifact({
+      registry: registryFor({
+        name: "replacement.png",
+        stream: Readable.from(["replacement"]),
+      }),
+      workspaceId: "ws_test",
+      workspaceRoot,
+      maxFileBytes: 1024,
+      file: { native: true },
+      path: "public/images/generated.png",
     }),
-    workspaceId: "ws_test",
-    workspaceRoot,
-    maxFileBytes: 1024,
-    file: { native: true },
-  });
-  assert.equal(second.path, ".devspace/incoming/generated (1).png");
-  assert.deepEqual(await readFile(join(workspaceRoot, second.path)), bytes);
+    "artifact_destination_exists",
+  );
+  assert.deepEqual(await readFile(join(workspaceRoot, first.path)), bytes);
+  assert.deepEqual(await readdir(join(workspaceRoot, ".devspace", "incoming")), []);
+}
 
-  const entries = await readdir(join(workspaceRoot, ".devspace", "incoming"));
-  assert.deepEqual(entries.sort(), ["generated (1).png", "generated.png"]);
+async function testDestinationValidation(testRoot: string): Promise<void> {
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot, { recursive: true });
+
+  for (const path of ["../outside.txt", "nested/../outside.txt", "/absolute.txt", "folder/"]) {
+    await expectArtifactError(
+      downloadIncomingArtifact({
+        registry: registryFor({ name: "blocked.txt", stream: Readable.from(["blocked"]) }),
+        workspaceId: "ws_test",
+        workspaceRoot,
+        maxFileBytes: 1024,
+        file: { native: true },
+        path,
+      }),
+      "artifact_destination_invalid",
+    );
+  }
 }
 
 async function testSizeLimitAndCleanup(testRoot: string): Promise<void> {
@@ -131,6 +154,7 @@ async function testSizeLimitAndCleanup(testRoot: string): Promise<void> {
       workspaceRoot,
       maxFileBytes: 4,
       file: { native: true },
+      path: "too-large.bin",
     }),
     "artifact_file_too_large",
   );
@@ -145,6 +169,7 @@ async function testSizeLimitAndCleanup(testRoot: string): Promise<void> {
       workspaceRoot,
       maxFileBytes: 4,
       file: { native: true },
+      path: "stream-too-large.bin",
     }),
     "artifact_file_too_large",
   );
@@ -162,6 +187,7 @@ async function testCrashLeftoverCleanup(testRoot: string): Promise<void> {
     workspaceRoot,
     maxFileBytes: 1024,
     file: { native: true },
+    path: "first.txt",
   });
 
   const incoming = join(workspaceRoot, ".devspace", "incoming");
@@ -180,6 +206,7 @@ async function testCrashLeftoverCleanup(testRoot: string): Promise<void> {
     workspaceRoot,
     maxFileBytes: 1024,
     file: { native: true },
+    path: "second.txt",
   });
 
   const entries = await readdir(incoming);
@@ -203,6 +230,7 @@ async function testUnsafeDirectoryPermissions(testRoot: string): Promise<void> {
       workspaceRoot,
       maxFileBytes: 1024,
       file: { native: true },
+      path: "blocked.txt",
     }),
     "artifact_directory_permissions_unsafe",
   );
@@ -224,6 +252,7 @@ async function testSymlinkRejection(testRoot: string): Promise<void> {
       workspaceRoot: linkedDevspaceRoot,
       maxFileBytes: 1024,
       file: { native: true },
+      path: "blocked.txt",
     }),
     "artifact_directory_unsafe",
   );
@@ -241,8 +270,45 @@ async function testSymlinkRejection(testRoot: string): Promise<void> {
       workspaceRoot: linkedIncomingRoot,
       maxFileBytes: 1024,
       file: { native: true },
+      path: "blocked.txt",
     }),
     "artifact_directory_unsafe",
+  );
+
+  const linkedDestinationRoot = join(testRoot, "linked-destination-workspace");
+  await mkdir(linkedDestinationRoot, { recursive: true });
+  await symlink(outside, join(linkedDestinationRoot, "assets"), "dir");
+  await expectArtifactError(
+    downloadIncomingArtifact({
+      registry: registryFor({ name: "blocked.txt", stream: Readable.from(["blocked"]) }),
+      workspaceId: "ws_test",
+      workspaceRoot: linkedDestinationRoot,
+      maxFileBytes: 1024,
+      file: { native: true },
+      path: "assets/blocked.txt",
+    }),
+    "artifact_destination_parent_unsafe",
+  );
+}
+
+async function testPrivateStagingPermissions(testRoot: string): Promise<void> {
+  if (process.platform === "win32") return;
+
+  const workspaceRoot = join(testRoot, "workspace");
+  const incoming = join(workspaceRoot, ".devspace", "incoming");
+  await mkdir(incoming, { recursive: true });
+  await chmod(incoming, 0o755);
+
+  await expectArtifactError(
+    downloadIncomingArtifact({
+      registry: registryFor({ name: "private.txt", stream: Readable.from(["private"]) }),
+      workspaceId: "ws_test",
+      workspaceRoot,
+      maxFileBytes: 1024,
+      file: { native: true },
+      path: "private.txt",
+    }),
+    "artifact_directory_permissions_unsafe",
   );
 }
 
@@ -254,6 +320,7 @@ function testLogRedaction(): void {
       file_name: "generated.png",
     },
     workspaceId: "ws_secret",
+    path: "private/generated.png",
   });
   const serialized = JSON.stringify(fields);
   assert.equal(serialized.includes("super-secret"), false);

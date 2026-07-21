@@ -185,7 +185,7 @@ interface ToolLogFields {
 
 function serverInstructions(config: ServerConfig): string {
   const artifactInstruction = config.artifactsEnabled
-    ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value and the existing workspace ID. DevSpace chooses a collision-free path under .devspace/incoming and returns that workspace-relative path. Use the normal workspace tools for any later move, rename, or deletion. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
+    ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
     : "";
   const showChangesInstruction =
     config.widgets === "changes"
