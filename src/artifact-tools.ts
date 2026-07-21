@@ -1,5 +1,6 @@
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { basename, isAbsolute, relative } from "node:path";
 import * as z from "zod/v4";
 import type { ServerConfig } from "./config.js";
 import {
@@ -9,7 +10,6 @@ import {
 import {
   ARTIFACT_CHUNK_BYTES,
   ArtifactError,
-  type ArtifactRecord,
   type ArtifactStore,
 } from "./artifacts.js";
 import {
@@ -36,25 +36,7 @@ const openAIFileReferenceInputSchema = z.object({
   size: z.number().int().nonnegative().nullable().optional(),
 });
 
-const artifactRecordOutputSchema = {
-  artifactId: z.string(),
-  name: z.string(),
-  mimeType: z.string().optional(),
-  size: z.number().int().nonnegative(),
-  sha256: z.string(),
-  hostPath: z.string(),
-  source: z.string(),
-  workspaceId: z.string().optional(),
-  createdAt: z.string(),
-  expiresAt: z.string().optional(),
-  pinned: z.boolean(),
-};
-
-type ArtifactToolName =
-  | "stage_artifact"
-  | "artifact_stat"
-  | "artifact_copy_to_workspace"
-  | "artifact_delete";
+type ArtifactToolName = "materialize_artifact";
 
 export interface ArtifactToolRegistrationOptions {
   config: ServerConfig;
@@ -83,6 +65,25 @@ export interface StageArtifactResult {
   instruction: string;
 }
 
+export interface MaterializeArtifactInput {
+  file: unknown;
+  workspaceId: string;
+  destination: string;
+  onConflict: ArtifactCopyConflictMode;
+  expectedSha256?: string;
+}
+
+export interface MaterializeArtifactResult {
+  workspaceId: string;
+  path: string;
+  name: string;
+  mimeType?: string;
+  size: number;
+  sha256: string;
+  onConflict: ArtifactCopyConflictMode;
+  renamed: boolean;
+}
+
 export function registerArtifactTools(
   server: McpServer,
   {
@@ -97,132 +98,104 @@ export function registerArtifactTools(
 
   registerAppTool(
     server,
-    "stage_artifact",
+    "materialize_artifact",
     {
-      title: "Stage attached or generated file",
+      title: "Materialize attached or generated file",
       description:
-        "Stage one ChatGPT-provided native file reference into private DevSpace storage. DevSpace downloads only the exact file object authorized by ChatGPT; arbitrary URLs and paths fail closed. A workspace ID is association metadata, not a write destination.",
+        "Save one MCP-host-provided native file into an already-open workspace. DevSpace validates the file reference, streams and verifies the bytes, and atomically writes the destination. Arbitrary URLs and host paths are rejected.",
       inputSchema: {
-        file: openAIFileReferenceInputSchema.describe("Native file value authorized and supplied by ChatGPT."),
-        workspaceId: z.string().min(1).optional().describe("Optional workspace association; never a write destination."),
+        file: openAIFileReferenceInputSchema.describe("Native file value authorized and supplied by the MCP host."),
+        workspaceId: z.string().min(1).describe("Workspace identifier returned by open_workspace."),
+        destination: z.string().min(1).describe("Relative file path inside the selected workspace."),
+        onConflict: z.enum(["error", "rename", "replace"]).default("error").describe("How to handle an existing destination."),
         expectedSha256: z.string().optional().describe("Optional expected SHA-256, with or without a sha256: prefix."),
-        ttlHours: z.number().int().min(1).max(24 * 365).optional().describe("Artifact lifetime after staging."),
-        pin: z.boolean().optional().describe("Preserve the artifact until explicitly deleted."),
       },
       outputSchema: {
-        artifactId: z.string(),
-        name: z.string(),
-        mimeType: z.string().optional(),
-        size: z.number().int().nonnegative(),
-        sha256: z.string(),
-        hostPath: z.string(),
-        expiresAt: z.string().optional(),
-        instruction: z.string(),
-      },
-      _meta: { "openai/fileParams": ["file"] },
-      annotations: ARTIFACT_WRITE_ANNOTATIONS,
-    },
-    async (input) => executeArtifactTool(config, "stage_artifact", input, async () => {
-      return stageIncomingArtifact({
-        store,
-        clientId,
-        registry: incomingRegistry,
-        input,
-      });
-    }),
-  );
-
-  registerAppTool(
-    server,
-    "artifact_stat",
-    {
-      title: "Inspect artifact",
-      description: "Return private artifact metadata by ID without returning its content.",
-      inputSchema: {
-        artifactId: z.string(),
-      },
-      outputSchema: artifactRecordOutputSchema,
-      _meta: {},
-      annotations: { readOnlyHint: true, openWorldHint: false },
-    },
-    async ({ artifactId }) => executeArtifactTool(
-      config,
-      "artifact_stat",
-      { artifactId },
-      async () => store.statArtifact(clientId, artifactId),
-    ),
-  );
-
-  registerAppTool(
-    server,
-    "artifact_copy_to_workspace",
-    {
-      title: "Copy artifact into workspace",
-      description:
-        "Copy one owner-scoped private artifact into a path inside an already-open workspace. The destination must stay within that workspace; choose rename or replace explicitly when a file exists.",
-      inputSchema: {
-        artifactId: z.string(),
-        workspaceId: z.string().min(1),
-        destination: z.string().min(1).describe("Relative path inside the selected workspace."),
-        onConflict: z.enum(["error", "rename", "replace"]).default("error"),
-      },
-      outputSchema: {
-        artifactId: z.string(),
         workspaceId: z.string(),
         path: z.string(),
+        name: z.string(),
+        mimeType: z.string().optional(),
         size: z.number().int().nonnegative(),
         sha256: z.string(),
         onConflict: z.enum(["error", "rename", "replace"]),
         renamed: z.boolean(),
       },
-      _meta: {},
+      _meta: { "openai/fileParams": ["file"] },
       annotations: ARTIFACT_WRITE_ANNOTATIONS,
     },
-    async (input) => executeArtifactTool(
-      config,
-      "artifact_copy_to_workspace",
-      input,
-      async () => {
-        const workspace = workspaces.getWorkspace(input.workspaceId);
-        const destination = workspaces.resolvePath(workspace, input.destination);
-        return copyArtifactToWorkspace({
-          store,
-          clientId,
-          workspaceId: workspace.id,
-          workspaceRoot: workspace.root,
-          artifactId: input.artifactId,
-          destination,
-          onConflict: input.onConflict as ArtifactCopyConflictMode,
-        });
-      },
-    ),
+    async (input) => executeArtifactTool(config, "materialize_artifact", input, async () => {
+      if (isAbsolute(input.destination)) {
+        throw new ArtifactError("workspace_destination_invalid", "Artifact destination must be a relative workspace path.");
+      }
+      const workspace = workspaces.getWorkspace(input.workspaceId);
+      const destination = workspaces.resolvePath(workspace, input.destination);
+      return materializeIncomingArtifact({
+        store,
+        clientId,
+        registry: incomingRegistry,
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.root,
+        destination,
+        input,
+      });
+    }),
   );
 
-  registerAppTool(
-    server,
-    "artifact_delete",
-    {
-      title: "Delete artifact",
-      description:
-        "Delete an artifact record. Its immutable object is removed only when no other live record references it.",
-      inputSchema: {
-        artifactId: z.string(),
-      },
-      outputSchema: {
-        artifactId: z.string(),
-        deleted: z.boolean(),
-        objectDeleted: z.boolean(),
-      },
-      _meta: {},
-      annotations: ARTIFACT_WRITE_ANNOTATIONS,
+}
+
+/** Materialize a native file through the private store, then remove its internal record. */
+export async function materializeIncomingArtifact({
+  store,
+  clientId,
+  registry,
+  workspaceId,
+  workspaceRoot,
+  destination,
+  input,
+}: {
+  store: ArtifactStore;
+  clientId: string;
+  registry: IncomingArtifactAdapterRegistry;
+  workspaceId: string;
+  workspaceRoot: string;
+  destination: string;
+  input: MaterializeArtifactInput;
+}): Promise<MaterializeArtifactResult> {
+  const staged = await stageIncomingArtifact({
+    store,
+    clientId,
+    registry,
+    input: {
+      file: input.file,
+      workspaceId,
+      expectedSha256: input.expectedSha256,
     },
-    async ({ artifactId }) => executeArtifactTool(
-      config,
-      "artifact_delete",
-      { artifactId },
-      async () => store.deleteArtifact(clientId, artifactId),
-    ),
-  );
+  });
+
+  try {
+    const copied = await copyArtifactToWorkspace({
+      store,
+      clientId,
+      workspaceId,
+      workspaceRoot,
+      artifactId: staged.artifactId,
+      destination,
+      onConflict: input.onConflict,
+    });
+    const path = relative(workspaceRoot, copied.path);
+    return {
+      workspaceId,
+      path,
+      name: basename(path),
+      mimeType: staged.mimeType,
+      size: copied.size,
+      sha256: copied.sha256,
+      onConflict: copied.onConflict,
+      renamed: copied.renamed,
+    };
+  } finally {
+    await store.deleteArtifact(clientId, staged.artifactId).catch(() => undefined);
+  }
 }
 
 export async function stageIncomingArtifact({
@@ -317,18 +290,15 @@ export function artifactToolLogFields(
   tool: ArtifactToolName,
   input: Record<string, unknown>,
 ): Record<string, unknown> {
-  if (tool === "stage_artifact") {
-    return {
-      fileProvided: input.file !== undefined,
-      fileReferenceShape: describeIncomingArtifactValue(input.file),
-      downloadUrlHostname: incomingFileDownloadHostname(input.file),
-      workspaceId: input.workspaceId,
-      expectedSha256Present: typeof input.expectedSha256 === "string",
-      ttlHours: input.ttlHours,
-      pin: input.pin === true,
-    };
-  }
-  return { artifactId: input.artifactId };
+  return {
+    fileProvided: input.file !== undefined,
+    fileReferenceShape: describeIncomingArtifactValue(input.file),
+    downloadUrlHostname: incomingFileDownloadHostname(input.file),
+    workspaceId: input.workspaceId,
+    destination: input.destination,
+    expectedSha256Present: typeof input.expectedSha256 === "string",
+    onConflict: input.onConflict,
+  };
 }
 
 async function executeArtifactTool<T extends object>(
@@ -372,12 +342,11 @@ function artifactToolResponse<T extends object>(result: T) {
 }
 
 function artifactResultLogFields(result: Record<string, unknown>): Record<string, unknown> {
-  const artifact = result as Partial<ArtifactRecord>;
   return {
-    artifactId: artifact.artifactId,
-    size: artifact.size,
-    sha256: artifact.sha256,
-    source: artifact.source,
-    objectDeleted: result.objectDeleted,
+    workspaceId: result.workspaceId,
+    path: result.path,
+    size: result.size,
+    sha256: result.sha256,
+    renamed: result.renamed,
   };
 }

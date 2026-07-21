@@ -48,6 +48,7 @@ export async function copyArtifactToWorkspace(
   const tempPath = join(parent, `.devspace-artifact-${randomUUID()}.partial`);
   let finalPath = input.destination;
   let materialized = false;
+  let replaceBackupPath: string | undefined;
   try {
     const copied = await copyVerifiedArtifactToTemp(artifact.hostPath, tempPath, artifact.size, artifact.sha256);
     await assertContainedWorkspaceRegularFile(input.workspaceRoot, tempPath);
@@ -58,6 +59,11 @@ export async function copyArtifactToWorkspace(
         throw new ArtifactError("workspace_destination_unsafe", "Replace is allowed only for an existing regular file.");
       }
       await ensureContainedWorkspaceDirectory(input.workspaceRoot, parent);
+      if (existing) {
+        replaceBackupPath = join(parent, `.devspace-artifact-${randomUUID()}.backup`);
+        await rename(finalPath, replaceBackupPath);
+        await assertContainedWorkspaceRegularFile(input.workspaceRoot, replaceBackupPath);
+      }
       await rename(tempPath, finalPath);
       materialized = true;
     } else {
@@ -91,6 +97,10 @@ export async function copyArtifactToWorkspace(
     if (finalEntry.size !== copied.size || `sha256:${digest}` !== copied.sha256) {
       throw new ArtifactError("workspace_copy_integrity_failed", "Workspace copy failed size or SHA-256 verification.");
     }
+    if (replaceBackupPath) {
+      await unlink(replaceBackupPath).catch(() => undefined);
+      replaceBackupPath = undefined;
+    }
     return {
       artifactId: artifact.artifactId,
       workspaceId: input.workspaceId,
@@ -104,6 +114,9 @@ export async function copyArtifactToWorkspace(
     await unlink(tempPath).catch(() => undefined);
     if (materialized) {
       await unlink(finalPath).catch(() => undefined);
+    }
+    if (replaceBackupPath) {
+      await rename(replaceBackupPath, finalPath).catch(() => undefined);
     }
     throw error;
   }

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import * as z from "zod/v4";
 import {
   artifactToolLogFields,
+  materializeIncomingArtifact,
   registerArtifactTools,
   stageIncomingArtifact,
 } from "./artifact-tools.js";
@@ -24,6 +25,7 @@ try {
   testChatGPTFileDescriptor();
   await testOpenAIFileAdapter(join(root, "openai"));
   await testStageArtifact(join(root, "stage"));
+  await testMaterializeArtifact(join(root, "materialize"));
   await testFailedStageCleanup(join(root, "failed-stage"));
   testStageLogRedaction();
 } finally {
@@ -50,13 +52,8 @@ function testChatGPTFileDescriptor(): void {
     clientId: "client-a",
   });
 
-  assert.deepEqual([...registered.keys()], [
-    "stage_artifact",
-    "artifact_stat",
-    "artifact_copy_to_workspace",
-    "artifact_delete",
-  ]);
-  const descriptor = registered.get("stage_artifact");
+  assert.deepEqual([...registered.keys()], ["materialize_artifact"]);
+  const descriptor = registered.get("materialize_artifact");
   assert.ok(descriptor);
   assert.deepEqual(descriptor._meta, { "openai/fileParams": ["file"] });
 
@@ -297,6 +294,45 @@ async function testStageArtifact(testRoot: string): Promise<void> {
   }
 }
 
+async function testMaterializeArtifact(testRoot: string): Promise<void> {
+  const bytes = Buffer.from("native artifact bytes");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot, { recursive: true });
+  const store = createStore(testRoot);
+  try {
+    const result = await materializeIncomingArtifact({
+      store,
+      clientId: "client-a",
+      registry: new IncomingArtifactAdapterRegistry([memoryAdapter("memory-test", bytes)]),
+      workspaceId: "ws_materialize",
+      workspaceRoot,
+      destination: join(workspaceRoot, "assets", "generated.bin"),
+      input: {
+        file: { kind: "memory" },
+        workspaceId: "ws_materialize",
+        destination: "assets/generated.bin",
+        onConflict: "error",
+      },
+    });
+    assert.deepEqual(await readFile(join(workspaceRoot, result.path)), bytes);
+    assert.deepEqual(result, {
+      workspaceId: "ws_materialize",
+      path: "assets/generated.bin",
+      name: "generated.bin",
+      mimeType: "application/octet-stream",
+      size: bytes.length,
+      sha256: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+      onConflict: "error",
+      renamed: false,
+    });
+    assert.equal("artifactId" in result, false);
+    assert.equal("hostPath" in result, false);
+    assert.equal(store.health().storedBytes, 0);
+  } finally {
+    store.close();
+  }
+}
+
 async function testFailedStageCleanup(testRoot: string): Promise<void> {
   const store = createStore(testRoot);
   try {
@@ -324,12 +360,12 @@ async function testFailedStageCleanup(testRoot: string): Promise<void> {
 
 function testStageLogRedaction(): void {
   const secret = "https://files.example.test/download?token=super-secret";
-  const fields = artifactToolLogFields("stage_artifact", {
+  const fields = artifactToolLogFields("materialize_artifact", {
     file: { download_url: secret, href: secret, bearer: "Bearer secret" },
     workspaceId: "ws_123",
+    destination: "assets/generated.png",
     expectedSha256: "f".repeat(64),
-    ttlHours: 24,
-    pin: true,
+    onConflict: "error",
   });
   const serialized = JSON.stringify(fields);
   assert.equal("file" in fields, false);

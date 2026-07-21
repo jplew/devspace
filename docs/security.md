@@ -123,26 +123,23 @@ accounts. Credentials, fragments, alternate ports, malformed IDs, extra fields,
 and redirects outside that boundary fail closed. Opaque IDs are bounded metadata
 and are never used as filenames or path components.
 
-The staging seam deliberately does not:
+The native materialization seam deliberately does not:
 
 - fetch arbitrary URLs
 - expose a generic upload API
-- automatically copy content into a workspace or repository
+- expose persistent artifact IDs or a user-facing artifact library
 - extract archives
 - execute transferred content
 - expand workspace allowlists
 - preserve executable permissions
 - publish or permanently retain content
 
-`artifact_copy_to_workspace` is the explicit exception: it reads only an
-owner-scoped staged artifact and writes only within an already-open allowed
-workspace. It requires a relative destination and an explicit conflict mode,
+`materialize_artifact` is the explicit, bounded write path: it accepts only a
+native MCP-host file value and writes only within an already-open allowed
+workspace. It requires a relative destination and explicit conflict mode,
 creates only real contained parent directories, rejects symlink/non-regular-file
-paths, and verifies the final size and SHA-256.
-
-MIME types are hints only. SHA-256 and byte counts are computed and enforced by
-the server. Pinned records require explicit deletion; unpinned records and
-failed in-progress transfers remain subject to cleanup.
+paths, and verifies the final size and SHA-256. Any private staging is server
+implementation detail and is cleaned up automatically.
 
 ## Logs
 
@@ -151,8 +148,7 @@ disabled unless `DEVSPACE_LOG_SHELL_COMMANDS=1`.
 
 Do not enable shell command logging if commands may contain secrets.
 
-Artifact tool logs contain identifiers, names, MIME hints, byte counts, hashes,
-and status fields. `stage_artifact` logs only whether a file value and expected
-digest were supplied plus non-sensitive options; it does not log the opaque
-file value. Raw content, connector references, bearer credentials, presigned
-URLs, and base64 chunks are never included in tool logs or tool results.
+Artifact tool logs contain bounded workspace, destination, conflict-mode,
+hostname, byte-count, hash, and status metadata. `materialize_artifact` does not
+log the opaque file value. Raw content, connector references, bearer credentials,
+presigned URLs, and base64 chunks are never included in tool logs or tool results.

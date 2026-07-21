@@ -50,7 +50,7 @@ DEVSPACE_ARTIFACTS=1 npx @waishnav/devspace serve
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DEVSPACE_ARTIFACTS` | `0` | Expose `stage_artifact`, `artifact_stat`, `artifact_copy_to_workspace`, and `artifact_delete`. |
+| `DEVSPACE_ARTIFACTS` | `0` | Expose `materialize_artifact` for trusted native files. |
 | `DEVSPACE_ARTIFACT_ROOT` | `~/.local/share/devspace/artifacts` | Private storage root outside repositories and worktrees. |
 | `DEVSPACE_ARTIFACT_MAX_FILE_BYTES` | `104857600` | Maximum decoded size of one artifact (100 MiB). |
 | `DEVSPACE_ARTIFACT_MAX_TOTAL_BYTES` | `1073741824` | Maximum combined stored-object and in-progress bytes (1 GiB). |
@@ -60,13 +60,12 @@ The same settings may be persisted in `~/.devspace/config.json` as
 `artifactsEnabled`, `artifactRoot`, `artifactMaxFileBytes`,
 `artifactMaxTotalBytes`, and `artifactDefaultTtlHours`.
 
-`stage_artifact` accepts only the native file object supplied by the ChatGPT
-connector. It does not accept arbitrary URL strings, paths, embedded credentials,
-or extra object fields. Files are streamed through bounded private storage.
-`artifact_copy_to_workspace` can then materialize one owner-scoped artifact into
-an already-open workspace at an explicit relative destination and conflict mode.
-Cleanup runs at startup and periodically, with a bounded number of records
-processed per pass.
+`materialize_artifact` accepts only the native file object supplied by the MCP
+connector and writes it to a relative destination inside an already-open workspace.
+It does not accept arbitrary URL strings, paths, embedded credentials, or extra
+object fields. Files are streamed through bounded private storage, then verified
+and automatically cleaned up after materialization. Startup and periodic cleanup
+also process stale internal state with bounded work per pass.
 
 See [Native Artifact Staging](artifact-exchange.md) for the supported connector
 shape and security boundaries.

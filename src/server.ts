@@ -189,7 +189,7 @@ interface ToolLogFields {
 
 function serverInstructions(config: ServerConfig): string {
   const artifactInstruction = config.artifactsEnabled
-    ? " When the user supplies or generates a file that is not present on the DevSpace host, pass its native file value to stage_artifact instead of recreating it through write/edit calls. To place a staged artifact in an approved workspace, use artifact_copy_to_workspace with that artifact ID, the existing workspace ID, a relative destination, and an explicit conflict mode. Only use host paths returned by artifact tools; never invent artifact-store paths or place artifact content, signed URLs, or base64 in shell commands or logs. stage_artifact stores privately and never writes into a workspace or repository; artifact_copy_to_workspace is the explicit materialization step and may dirty a repository."
+    ? " When the user supplies or generates a file that is not present on the DevSpace host, use materialize_artifact with its native file value, the existing workspace ID, a relative destination, and an explicit conflict mode. Do not recreate binary files with write/edit calls. Do not place signed URLs, native file objects, base64 content, or invented artifact-storage paths in shell commands or logs. materialize_artifact validates, streams, verifies, and writes the file into the selected workspace; it may dirty a repository."
     : "";
   const showChangesInstruction =
     config.widgets === "changes"
