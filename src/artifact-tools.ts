@@ -43,7 +43,7 @@ const ARTIFACT_DOWNLOAD_PLATFORMS = new Set<NodeJS.Platform>([
   "netbsd",
 ]);
 
-const openAIFileReferenceInputSchema = z.object({
+const openAIFileReferenceInputSchema = z.strictObject({
   download_url: z.string(),
   file_id: z.string(),
   mime_type: z.string().nullable().optional(),

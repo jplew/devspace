@@ -94,52 +94,20 @@ sessions.
 
 ## Native File Download
 
-Native file download is an opt-in, one-shot byte-transfer seam. It has no
-persistent artifact root, object database, upload lifecycle, reusable artifact
-ID, public download route, TTL, pinning, or quota ledger.
+Native file download is an opt-in, one-shot transfer into an already-open
+workspace. `download_artifact` accepts the MCP host's native file value, the
+`workspaceId` returned by `open_workspace`, and an unused relative destination
+path. It returns only the workspace-relative path and does not create a
+persistent artifact service or reusable artifact ID.
 
-The production server declares ChatGPT's top-level `openai/fileParams` contract
-and accepts only the documented `download_url`, `file_id`, optional
-MIME/filename aliases, and optional size. Downloads use HTTPS on
-`files.oaiusercontent.com` or the constrained regional OpenAI Azure account
-family `oaisdmntpr<region>.blob.core.windows.net`, where `<region>` is lowercase
-alphanumeric. Arbitrary Azure Blob accounts, alternate ports, credentials,
-fragments, malformed IDs, extra fields, and redirects outside that boundary fail
-closed. Opaque IDs are bounded metadata and are never used as filenames or path
-components.
+DevSpace accepts only the documented native-file object and trusted OpenAI
+download hosts and redirects. Arbitrary URL strings, local source paths,
+credentials, malformed references, and unknown object fields are rejected.
 
-`download_artifact` accepts only the native file value, a `workspaceId` returned
-by `open_workspace`, and a relative destination `path`. Absolute paths,
-traversal, symlinked parents, and existing destinations fail closed. Callers
-cannot supply a conflict mode, expected hash, host path, or storage policy.
-
-The selected workspace is opened without following symlinks. Requested
-destination parents are created or opened component-by-component through
-descriptor anchors, and the temporary partial is created beside the requested
-destination. DevSpace does not create a project-level artifact or staging
-directory. Replacing a pathname therefore cannot redirect writes outside the
-selected workspace. Symlinked components, non-directories, and existing
-destination files fail closed. Existing directories are inspected but are never
-chmodded as a startup side effect.
-
-Bytes stream into an exclusive mode-`0600` partial under the configured per-file
-limit. DevSpace computes SHA-256 while writing, verifies any size hint, then
-publishes the verified inode with a no-overwrite atomic hard link at the
-requested path and verifies the published inode identity. Permissions and sync
-are fixed before publication, and the published file retains owner-only mode
-`0600`. It does not path-chmod or path-hash the published file. Partials are
-removed on success or failure;
-crash-leftover cleanup is bounded within the requested destination directory and
-only considers owned, regular DevSpace partial files.
-
-The native download seam deliberately does not:
-
-- fetch arbitrary URLs or local paths;
-- expose generic upload/chunk/stat/delete/copy tools;
-- expose artifact IDs, signed URLs, host paths, temp paths, or raw content;
-- extract archives or execute transferred content;
-- expand workspace allowlists;
-- preserve executable permissions;
+Absolute paths, traversal, symlinked parents, and existing destinations also
+fail closed. Downloads stream under the configured per-file limit and are
+published without overwrite as owner-only files. DevSpace does not extract or
+execute transferred content.
 
 ## Logs
 

@@ -87,6 +87,14 @@ function testOneToolContract(): void {
   };
   assert.deepEqual(fileSchema.parse(valid), valid);
   assert.throws(() => fileSchema.parse({ file_id: "file_123" }));
+
+  const sensitiveExtraValue = "Bearer should-not-leak";
+  const rejected = fileSchema.safeParse({
+    ...valid,
+    authorization: sensitiveExtraValue,
+  });
+  assert.equal(rejected.success, false);
+  assert.equal(JSON.stringify(rejected).includes(sensitiveExtraValue), false);
 }
 
 function testPlatformSupportContract(): void {
@@ -343,6 +351,7 @@ function testLogRedaction(): void {
       download_url: "https://files.oaiusercontent.com/file_123/download?sig=super-secret",
       file_id: "file_secret",
       file_name: "generated.png",
+      authorization: "Bearer log-secret",
     },
     workspaceId: "ws_secret",
     path: "private/generated.png",
@@ -350,6 +359,7 @@ function testLogRedaction(): void {
   const serialized = JSON.stringify(fields);
   assert.equal(serialized.includes("super-secret"), false);
   assert.equal(serialized.includes("file_secret"), false);
+  assert.equal(serialized.includes("log-secret"), false);
   assert.equal(serialized.includes("ws_secret"), true);
   assert.equal(serialized.includes("files.oaiusercontent.com"), true);
 }
